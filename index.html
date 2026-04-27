@@ -147,9 +147,11 @@
     border-radius: 8px;
   }
   .file-row.folder .icon { background: rgba(255, 200, 100, 0.15); }
+  .file-row.folder.shared .icon { background: rgba(120, 180, 255, 0.18); }
   .file-row.zip .icon { background: var(--accent-soft); }
   .file-row .icon svg { width: 22px; height: 22px; }
   .file-row.folder .icon svg { color: #ffc864; }
+  .file-row.folder.shared .icon svg { color: #78b4ff; }
   .file-row.zip .icon svg { color: var(--accent); }
 
   /* Larger thumbnail rows for ZIP files: ~120px tall cover image on the left,
@@ -384,6 +386,13 @@
     </button>
     <div class="title" id="reader-title">—</div>
     <button class="icon-btn" id="view-mode-btn" title="Toggle view mode"></button>
+    <button class="icon-btn hidden" id="pair-offset-btn" title="見開きペアの構成を切替">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M7 8l-4 4 4 4"/>
+        <path d="M17 8l4 4-4 4"/>
+        <path d="M3 12h18"/>
+      </svg>
+    </button>
     <button class="icon-btn" id="fullscreen-btn" title="Fullscreen"></button>
     <div class="page-counter" id="page-counter">0 / 0</div>
   </div>
@@ -601,6 +610,29 @@ async function listFolder(folderId) {
   return data.files || [];
 }
 
+async function listSharedFolders() {
+  // Folders shared with the user (Shared with me). These don't appear under
+  // 'root' parents — they live in a separate Drive space and need their own
+  // query. We pin them to the top of the My Drive root view.
+  const q = "sharedWithMe = true and mimeType = 'application/vnd.google-apps.folder' and trashed = false";
+  const params = new URLSearchParams({
+    q,
+    fields: 'files(id,name,mimeType,modifiedTime,owners(displayName))',
+    pageSize: '200',
+    orderBy: 'name',
+    spaces: 'drive',
+    supportsAllDrives: 'true',
+    includeItemsFromAllDrives: 'true',
+  });
+  const resp = await driveFetch('https://www.googleapis.com/drive/v3/files?' + params);
+  if (!resp.ok) {
+    console.warn('Shared folder list failed:', resp.status);
+    return [];
+  }
+  const data = await resp.json();
+  return data.files || [];
+}
+
 async function searchDrive(query) {
   // Drive query syntax: escape single quotes by backslash
   const escaped = query.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
@@ -779,6 +811,11 @@ function getProgress(fileId) {
   return e ? e.page : null;
 }
 
+function getPairOffset(fileId) {
+  const e = state.progress.files[fileId];
+  return (e && e.pairOffset) || 0;
+}
+
 function setProgress(fileId, page, meta) {
   const existing = state.progress.files[fileId] || {};
   const next = {
@@ -790,6 +827,7 @@ function setProgress(fileId, page, meta) {
     if (meta.name) next.name = meta.name;
     if (meta.size != null) next.size = meta.size;
     if (meta.totalPages != null) next.totalPages = meta.totalPages;
+    if (meta.pairOffset != null) next.pairOffset = meta.pairOffset;
   }
   state.progress.files[fileId] = next;
   saveLocalMirror();
@@ -1184,9 +1222,30 @@ async function loadCurrentFolder() {
 
   $('file-list').innerHTML = '<div class="spinner"></div>';
   try {
-    const all = await listFolder(stack[stack.length - 1].id);
+    const cur = stack[stack.length - 1];
+    const isRoot = stack.length === 1 && cur.id === 'root';
+
+    // At My Drive root, also fetch "Shared with me" folders and pin them on top.
+    // Subfolders only show their own contents (shared folders only live at root).
+    let all;
+    if (isRoot) {
+      const [shared, own] = await Promise.all([
+        listSharedFolders(),
+        listFolder(cur.id),
+      ]);
+      // Mark shared folders so renderFileList can label them and sorter
+      // can hoist them to the top.
+      shared.forEach(f => { f._shared = true; });
+      all = [...shared, ...own];
+    } else {
+      all = await listFolder(cur.id);
+    }
+
     const filtered = all.filter(f => isFolder(f) || isZip(f));
     filtered.sort((a, b) => {
+      // Shared folders first, then own folders, then ZIP files.
+      const aShared = !!a._shared, bShared = !!b._shared;
+      if (aShared !== bShared) return aShared ? -1 : 1;
       if (isFolder(a) !== isFolder(b)) return isFolder(a) ? -1 : 1;
       return naturalCompare(a.name, b.name);
     });
@@ -1231,7 +1290,18 @@ function renderFileList(files) {
 
   list.innerHTML = files.map((f, i) => {
     const folder = isFolder(f);
-    const sizeStr = folder ? 'Folder' : fmtBytes(f.size);
+    const shared = !!f._shared;
+    let sizeStr;
+    if (folder) {
+      if (shared) {
+        const owner = f.owners && f.owners[0] && f.owners[0].displayName;
+        sizeStr = owner ? `共有 · ${owner}` : '共有フォルダ';
+      } else {
+        sizeStr = 'Folder';
+      }
+    } else {
+      sizeStr = fmtBytes(f.size);
+    }
     let progressTag = '';
     if (!folder) {
       const page = getProgress(f.id);
@@ -1243,8 +1313,9 @@ function renderFileList(files) {
       ? `<div class="icon">${folderIcon}</div>`
       : `<div class="icon">${zipIcon}</div>
          <div class="thumb"><span class="thumb-fallback">${zipIcon}</span><img alt="" loading="lazy" style="display:none;transition:opacity .2s"></div>`;
+    const rowClass = `file-row ${folder ? 'folder' : 'zip'}${shared ? ' shared' : ''}`;
     return `
-      <div class="file-row ${folder ? 'folder' : 'zip'}" data-i="${i}">
+      <div class="${rowClass}" data-i="${i}">
         ${visual}
         <div class="meta">
           <div class="name">${escapeHtml(f.name)}</div>
@@ -1442,6 +1513,7 @@ class Reader {
     this.slots = [];                 // each is array of page indices
     this.currentSlotIndex = 0;
     this.viewMode = localStorage.getItem(STORAGE_VIEW_MODE) || 'single';
+    this.pairOffset = getPairOffset(file.id); // 0 = cover-alone first, 1 = pair from page 1
     this.bitmapCache = new Map();    // pageIndex -> blobUrl
     this.cacheLimit = 40;            // generous; manga pages ~200-500KB ≈ 8-20MB
     this.loading = new Map();
@@ -1458,6 +1530,7 @@ class Reader {
     $('reader-pages').innerHTML =
       '<div class="page-slot"><div class="page-cell"><div class="placeholder"><div class="spinner small"></div>Reading archive…</div></div></div>';
     this.updateViewModeIcon();
+    this.updatePairOffsetButton();
     showScreen('reader-screen');
 
     try {
@@ -1504,8 +1577,14 @@ class Reader {
     const n = this.imageEntries.length;
     if (this.viewMode === 'spread') {
       const slots = [];
-      if (n > 0) slots.push([0]);  // cover alone
-      for (let i = 1; i < n; i += 2) {
+      let start = 0;
+      // pairOffset 0: cover stands alone, then pairs start from page index 1
+      // pairOffset 1: every page is paired starting from index 0 (no cover-alone)
+      if (this.pairOffset === 0 && n > 0) {
+        slots.push([0]);
+        start = 1;
+      }
+      for (let i = start; i < n; i += 2) {
         if (i + 1 < n) slots.push([i, i + 1]);
         else slots.push([i]);
       }
@@ -1573,8 +1652,11 @@ class Reader {
     }
   }
 
-  scrollToSlot(slotIdx, smooth = true) {
-    const el = document.querySelector(`.page-slot[data-slot="${slotIdx}"]`);
+  scrollToSlot(slotIdx, smooth = false) {
+    // Default behavior is 'instant' — page flips feel snappier without the
+    // 300–500ms smooth-scroll animation. Pass smooth=true for cases where
+    // a transition is genuinely useful.
+    const el = $('reader-pages').querySelector(`.page-slot[data-slot="${slotIdx}"]`);
     if (el) {
       el.scrollIntoView({ behavior: smooth ? 'smooth' : 'instant', inline: 'start', block: 'nearest' });
     }
@@ -1688,6 +1770,7 @@ class Reader {
     this.viewMode = mode;
     localStorage.setItem(STORAGE_VIEW_MODE, mode);
     this.updateViewModeIcon();
+    this.updatePairOffsetButton();
     this.buildSlots();
     this.currentSlotIndex = this.findSlotForPage(currentPage);
     this.renderSlots();
@@ -1702,11 +1785,34 @@ class Reader {
     this.setViewMode(this.viewMode === 'single' ? 'spread' : 'single');
   }
 
+  togglePairOffset() {
+    if (this.viewMode !== 'spread') return;
+    const currentPage = (this.slots[this.currentSlotIndex] || [0])[0];
+    this.pairOffset = this.pairOffset === 0 ? 1 : 0;
+    setProgress(this.file.id, currentPage, { pairOffset: this.pairOffset });
+    this.buildSlots();
+    this.currentSlotIndex = this.findSlotForPage(currentPage);
+    this.renderSlots();
+    requestAnimationFrame(() => {
+      this.scrollToSlot(this.currentSlotIndex, false);
+      this.updateCounter();
+      this.preload();
+    });
+    toast(this.pairOffset === 0 ? '表紙単独' : '表紙からペア', 1200);
+  }
+
   updateViewModeIcon() {
     // Show the icon of the OTHER mode (i.e. what clicking will switch TO)
     const next = this.viewMode === 'single' ? 'spread' : 'single';
     $('view-mode-btn').innerHTML = VIEW_MODE_ICONS[next];
     $('view-mode-btn').title = next === 'spread' ? 'Switch to spread view' : 'Switch to single page';
+  }
+
+  updatePairOffsetButton() {
+    // Pair-offset toggle is meaningful only when reading in spread mode.
+    const btn = $('pair-offset-btn');
+    if (!btn) return;
+    btn.classList.toggle('hidden', this.viewMode !== 'spread');
   }
 
   destroy() {
@@ -1728,7 +1834,7 @@ function openZip(file) {
   state.reader.start();
 }
 
-async function closeReader() {
+function closeReader() {
   if (state.reader) {
     state.reader.destroy();
     state.reader = null;
@@ -1737,11 +1843,17 @@ async function closeReader() {
     const exitFn = document.exitFullscreen || document.webkitExitFullscreen;
     if (exitFn) exitFn.call(document);
   }
-  await flushProgressSave().catch(() => {});
+  // CRITICAL: switch screens synchronously. When called from popstate (e.g.
+  // tablet swipe-back), Safari freezes a snapshot of the previous page during
+  // the swipe animation. If we await anything here, the DOM isn't updated by
+  // the time the snapshot fades out — the user sees the old reader screen
+  // come back, then a delayed swap to the file list. Saving progress to
+  // Drive must happen in the background.
   if (state.history) renderHistory();
   else if (state.searching) renderFileList(state.searchResults);
   else renderFileList(state.currentFiles);
   showScreen('browser-screen');
+  flushProgressSave().catch(() => {});  // fire-and-forget
 }
 
 //===========================================================================
@@ -1878,6 +1990,9 @@ function wireReader() {
   $('view-mode-btn').addEventListener('click', () => {
     if (state.reader) state.reader.toggleViewMode();
   });
+  $('pair-offset-btn').addEventListener('click', () => {
+    if (state.reader) state.reader.togglePairOffset();
+  });
   $('fullscreen-btn').addEventListener('click', toggleFullscreen);
   updateFullscreenIcon();
 
@@ -1903,6 +2018,7 @@ function wireReader() {
     else if (e.key === 'ArrowLeft') state.reader && state.reader.next();   // RTL
     else if (e.key === 'ArrowRight') state.reader && state.reader.prev();
     else if (e.key === 'v' || e.key === 'V') state.reader && state.reader.toggleViewMode();
+    else if (e.key === 'p' || e.key === 'P') state.reader && state.reader.togglePairOffset();
     else if (e.key === 'f' || e.key === 'F') toggleFullscreen();
   });
 }
