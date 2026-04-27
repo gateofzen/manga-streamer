@@ -1446,6 +1446,10 @@ class Reader {
     this.cacheLimit = 40;            // generous; manga pages ~200-500KB ≈ 8-20MB
     this.loading = new Map();
     this._scrollHandler = null;
+    this.cancelled = false;          // flipped by destroy() to short-circuit
+                                     // any in-flight loads/handlers that
+                                     // would otherwise touch DOM after the
+                                     // reader has been replaced
   }
 
   async start() {
@@ -1532,6 +1536,7 @@ class Reader {
 
     if (this._scrollHandler) container.removeEventListener('scroll', this._scrollHandler);
     this._scrollHandler = () => {
+      if (this.cancelled) return;
       const slots = container.querySelectorAll('.page-slot');
       const cRect = container.getBoundingClientRect();
       const cMid = cRect.left + cRect.width / 2;
@@ -1612,6 +1617,7 @@ class Reader {
   }
 
   async loadPage(pageIndex) {
+    if (this.cancelled) return;
     if (this.bitmapCache.has(pageIndex)) {
       const url = this.bitmapCache.get(pageIndex);
       this.bitmapCache.delete(pageIndex);
@@ -1625,6 +1631,11 @@ class Reader {
       try {
         const entry = this.imageEntries[pageIndex];
         const bytes = await this.zip.readEntry(entry);
+        // The reader may have been closed/replaced while we were fetching.
+        // Drop the result silently — touching DOM here would corrupt the
+        // currently-open reader (the new page-cell with the same data-page
+        // index belongs to a different file).
+        if (this.cancelled) return;
         const ext = entry.name.split('.').pop().toLowerCase();
         const mime = ext === 'png' ? 'image/png'
                    : ext === 'webp' ? 'image/webp'
@@ -1637,7 +1648,8 @@ class Reader {
         this.evictCache();
         this.attachImage(pageIndex, url);
       } catch (e) {
-        const cell = document.querySelector(`.page-cell[data-page="${pageIndex}"]`);
+        if (this.cancelled) return;
+        const cell = $('reader-pages').querySelector(`.page-cell[data-page="${pageIndex}"]`);
         if (cell) cell.innerHTML = `<div class="placeholder">Error: ${escapeHtml(e.message)}</div>`;
       } finally {
         this.loading.delete(pageIndex);
@@ -1649,7 +1661,10 @@ class Reader {
   }
 
   attachImage(pageIndex, url) {
-    const cell = document.querySelector(`.page-cell[data-page="${pageIndex}"]`);
+    if (this.cancelled) return;
+    // Scope the query to #reader-pages so we never accidentally write to a
+    // cell from a different file (matters when reader was replaced mid-load).
+    const cell = $('reader-pages').querySelector(`.page-cell[data-page="${pageIndex}"]`);
     if (cell && !cell.querySelector('img')) {
       cell.innerHTML = `<img alt="" src="${url}">`;
     }
@@ -1661,7 +1676,8 @@ class Reader {
       const url = this.bitmapCache.get(oldestKey);
       URL.revokeObjectURL(url);
       this.bitmapCache.delete(oldestKey);
-      const cell = document.querySelector(`.page-cell[data-page="${oldestKey}"]`);
+      if (this.cancelled) continue;
+      const cell = $('reader-pages').querySelector(`.page-cell[data-page="${oldestKey}"]`);
       if (cell) cell.innerHTML = '<div class="placeholder"><div class="spinner small"></div></div>';
     }
   }
@@ -1694,6 +1710,11 @@ class Reader {
   }
 
   destroy() {
+    this.cancelled = true;
+    if (this._scrollHandler) {
+      $('reader-pages').removeEventListener('scroll', this._scrollHandler);
+      this._scrollHandler = null;
+    }
     for (const url of this.bitmapCache.values()) URL.revokeObjectURL(url);
     this.bitmapCache.clear();
     this.loading.clear();
