@@ -231,9 +231,11 @@
   .page-slot {
     flex: 0 0 100%; height: 100%;
     scroll-snap-align: start;
-    display: flex;  /* LTR within slot — the parent's row-reverse already
-                       inverts the visual order, so cells in DOM order
-                       [low, high] render as [high-on-LEFT, low-on-RIGHT]. */
+    /* RTL within slot too: DOM [low, high] renders visually as
+       [high on LEFT, low on RIGHT] — the correct right-bound manga layout.
+       The parent #reader-pages also uses row-reverse, but that only affects
+       the order of slots themselves, not cells inside them. */
+    display: flex; flex-direction: row-reverse;
     align-items: center; justify-content: center;
     position: relative;
   }
@@ -242,9 +244,11 @@
     display: flex; align-items: center; justify-content: center;
     overflow: hidden;
   }
-  /* Spread mode: push images toward the spine so they touch in the center.
-     With the parent row-reverse, DOM :first-child (low page #) lands on the
-     RIGHT, and :last-child (high page #) lands on the LEFT. */
+  /* Spread mode: push images toward the spine (slot center) so they touch.
+     With slot row-reverse, :first-child (DOM low page #) renders on the
+     RIGHT — its spine edge is its LEFT side → flex-start. :last-child
+     (DOM high page #) renders on the LEFT — its spine edge is its RIGHT
+     side → flex-end. */
   .page-slot.spread .page-cell:first-child { justify-content: flex-start; }
   .page-slot.spread .page-cell:last-child  { justify-content: flex-end; }
   .page-cell img {
