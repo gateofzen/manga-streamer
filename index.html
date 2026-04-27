@@ -1,0 +1,951 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#0a0a0a">
+<title>Manga Streamer</title>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<style>
+  :root {
+    --bg: #0a0a0a;
+    --surface: #161616;
+    --surface-2: #1f1f1f;
+    --border: #2a2a2a;
+    --text: #f0f0f0;
+    --text-dim: #888;
+    --accent: #ff4d4d;
+    --accent-soft: rgba(255, 77, 77, 0.12);
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Hiragino Kaku Gothic ProN",
+                 "Yu Gothic Medium", "Meiryo", sans-serif;
+    overscroll-behavior: none;
+  }
+  button { font: inherit; color: inherit; cursor: pointer; }
+  .hidden { display: none !important; }
+
+  /* ---------- Sign-in screen ---------- */
+  #signin-screen {
+    min-height: 100vh; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; padding: 24px;
+    text-align: center;
+  }
+  #signin-screen h1 {
+    margin: 0 0 8px; font-size: 32px; letter-spacing: 0.04em;
+    font-weight: 700;
+  }
+  #signin-screen h1 .accent { color: var(--accent); }
+  #signin-screen p.tagline {
+    margin: 0 0 32px; color: var(--text-dim); font-size: 14px;
+  }
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 20px; max-width: 480px; width: 100%;
+    text-align: left;
+  }
+  .card label {
+    display: block; font-size: 12px; color: var(--text-dim);
+    margin-bottom: 6px; letter-spacing: 0.05em; text-transform: uppercase;
+  }
+  .card input {
+    width: 100%; padding: 10px 12px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--surface-2);
+    color: var(--text); font-size: 14px; font-family: ui-monospace, monospace;
+  }
+  .card input:focus { outline: none; border-color: var(--accent); }
+  .btn-primary {
+    width: 100%; padding: 12px 16px; margin-top: 16px;
+    background: var(--accent); color: #fff; border: none;
+    border-radius: 8px; font-size: 15px; font-weight: 600;
+    transition: filter 0.15s;
+  }
+  .btn-primary:hover { filter: brightness(1.1); }
+  .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+  .help {
+    margin-top: 16px; padding: 12px; background: var(--surface-2);
+    border-radius: 8px; font-size: 12px; color: var(--text-dim);
+    line-height: 1.6;
+  }
+  .help code {
+    color: var(--text); background: var(--bg); padding: 1px 4px;
+    border-radius: 3px; font-size: 11px;
+  }
+
+  /* ---------- Browser screen ---------- */
+  #browser-screen {
+    display: flex; flex-direction: column; height: 100vh;
+  }
+  .topbar {
+    display: flex; align-items: center; gap: 12px;
+    padding: 12px 16px; background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 10;
+  }
+  .topbar .breadcrumb {
+    flex: 1; font-size: 14px; color: var(--text-dim);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    direction: rtl; text-align: left;
+  }
+  .topbar .breadcrumb span { color: var(--text); }
+  .icon-btn {
+    background: transparent; border: none; color: var(--text);
+    width: 36px; height: 36px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    transition: background 0.15s;
+  }
+  .icon-btn:hover { background: var(--surface-2); }
+  .icon-btn svg { width: 20px; height: 20px; }
+
+  #file-list {
+    flex: 1; overflow-y: auto; padding: 8px 0;
+  }
+  .file-row {
+    display: flex; align-items: center; gap: 14px;
+    padding: 12px 16px; cursor: pointer;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+    transition: background 0.1s;
+  }
+  .file-row:hover { background: var(--surface); }
+  .file-row .icon {
+    width: 36px; height: 36px; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: 8px;
+  }
+  .file-row.folder .icon { background: rgba(255, 200, 100, 0.15); }
+  .file-row.zip .icon { background: var(--accent-soft); }
+  .file-row .icon svg { width: 22px; height: 22px; }
+  .file-row.folder .icon svg { color: #ffc864; }
+  .file-row.zip .icon svg { color: var(--accent); }
+  .file-row .meta { flex: 1; min-width: 0; }
+  .file-row .name {
+    font-size: 14px; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .file-row .sub {
+    font-size: 11px; color: var(--text-dim); margin-top: 2px;
+  }
+
+  .empty-state {
+    text-align: center; padding: 60px 20px; color: var(--text-dim);
+    font-size: 14px;
+  }
+  .spinner {
+    width: 28px; height: 28px;
+    border: 3px solid var(--surface-2);
+    border-top-color: var(--accent);
+    border-radius: 50%; animation: spin 0.8s linear infinite;
+    margin: 40px auto;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ---------- Reader screen ---------- */
+  #reader-screen {
+    position: fixed; inset: 0; background: #000; z-index: 100;
+    display: flex; flex-direction: column;
+    overscroll-behavior: contain;
+  }
+  #reader-pages {
+    flex: 1; display: flex; flex-direction: row-reverse;
+    overflow-x: auto; overflow-y: hidden;
+    scroll-snap-type: x mandatory;
+    scrollbar-width: none;
+  }
+  #reader-pages::-webkit-scrollbar { display: none; }
+  .page-slot {
+    flex: 0 0 100%; height: 100%;
+    scroll-snap-align: start;
+    display: flex; align-items: center; justify-content: center;
+    position: relative;
+  }
+  .page-slot img {
+    max-width: 100%; max-height: 100%;
+    object-fit: contain;
+    user-select: none; -webkit-user-drag: none;
+  }
+  .page-slot .placeholder {
+    color: var(--text-dim); font-size: 14px;
+    display: flex; flex-direction: column; align-items: center; gap: 12px;
+  }
+  .page-slot .placeholder .spinner { margin: 0; }
+
+  #reader-overlay {
+    position: absolute; left: 0; right: 0; top: 0;
+    padding: env(safe-area-inset-top, 0) 16px 12px;
+    padding-top: max(env(safe-area-inset-top, 0), 8px);
+    background: linear-gradient(to bottom, rgba(0,0,0,0.85), transparent);
+    display: flex; align-items: center; gap: 12px;
+    transition: opacity 0.25s, transform 0.25s;
+    z-index: 2;
+  }
+  #reader-overlay.hidden-overlay {
+    opacity: 0; transform: translateY(-100%); pointer-events: none;
+  }
+  #reader-overlay .title {
+    flex: 1; font-size: 14px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  #reader-overlay .page-counter {
+    font-variant-numeric: tabular-nums; font-size: 13px;
+    color: var(--text-dim);
+  }
+
+  #reader-zones {
+    position: absolute; inset: 0;
+    display: grid; grid-template-columns: 1fr 1fr 1fr;
+    z-index: 1; pointer-events: none;
+  }
+  #reader-zones > div { pointer-events: auto; }
+
+  /* Toast */
+  #toast {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+    background: var(--surface); border: 1px solid var(--border);
+    color: var(--text); padding: 10px 16px; border-radius: 24px;
+    font-size: 13px; z-index: 200; opacity: 0;
+    transition: opacity 0.2s; pointer-events: none;
+  }
+  #toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+
+<!-- ===== Sign-in screen ===== -->
+<div id="signin-screen">
+  <h1>Manga<span class="accent">.</span>Streamer</h1>
+  <p class="tagline">Stream ZIP/CBZ manga from Google Drive</p>
+
+  <div class="card">
+    <label for="client-id">Google OAuth Client ID</label>
+    <input id="client-id" type="text" placeholder="xxxxxxxx-xxxx.apps.googleusercontent.com" autocomplete="off" spellcheck="false">
+    <button id="signin-btn" class="btn-primary" disabled>Sign in with Google</button>
+    <div class="help">
+      <strong>Setup (first time only)</strong><br>
+      1. Go to <a href="https://console.cloud.google.com/" target="_blank" style="color:var(--accent)">Google Cloud Console</a> → APIs &amp; Services<br>
+      2. Enable <code>Google Drive API</code><br>
+      3. Create OAuth 2.0 Client ID (type: Web application)<br>
+      4. Add this page's URL to <em>Authorized JavaScript origins</em><br>
+      5. Paste the Client ID above (saved locally)
+    </div>
+  </div>
+</div>
+
+<!-- ===== Browser screen ===== -->
+<div id="browser-screen" class="hidden">
+  <div class="topbar">
+    <button class="icon-btn" id="back-btn" title="Back">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M19 12H5M12 19l-7-7 7-7"/>
+      </svg>
+    </button>
+    <div class="breadcrumb" id="breadcrumb"><span>My Drive</span></div>
+    <button class="icon-btn" id="signout-btn" title="Sign out">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/>
+      </svg>
+    </button>
+  </div>
+  <div id="file-list">
+    <div class="spinner"></div>
+  </div>
+</div>
+
+<!-- ===== Reader screen ===== -->
+<div id="reader-screen" class="hidden">
+  <div id="reader-overlay">
+    <button class="icon-btn" id="reader-close" title="Close">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M18 6L6 18M6 6l12 12"/>
+      </svg>
+    </button>
+    <div class="title" id="reader-title">—</div>
+    <div class="page-counter" id="page-counter">0 / 0</div>
+  </div>
+  <div id="reader-zones">
+    <div id="zone-right" data-action="prev"></div>
+    <div id="zone-mid" data-action="toggle"></div>
+    <div id="zone-left" data-action="next"></div>
+  </div>
+  <div id="reader-pages"></div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+//===========================================================================
+// Config & state
+//===========================================================================
+const SCOPE = 'https://www.googleapis.com/auth/drive.readonly';
+const STORAGE_CLIENT_ID = 'mangaStreamer.clientId';
+const STORAGE_PROGRESS = 'mangaStreamer.progress';
+
+const state = {
+  clientId: null,
+  accessToken: null,
+  tokenClient: null,
+  tokenExpiresAt: 0,
+  folderStack: [{ id: 'root', name: 'My Drive' }],
+  currentFiles: [],
+  reader: null,
+};
+
+//===========================================================================
+// Utilities
+//===========================================================================
+function $(id) { return document.getElementById(id); }
+function showScreen(id) {
+  ['signin-screen', 'browser-screen', 'reader-screen'].forEach(s => {
+    $(s).classList.toggle('hidden', s !== id);
+  });
+}
+function toast(msg, ms = 2400) {
+  const el = $('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => el.classList.remove('show'), ms);
+}
+function naturalCompare(a, b) {
+  return a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
+}
+function fmtBytes(n) {
+  if (n == null) return '';
+  const u = ['B','KB','MB','GB'];
+  let i = 0; let v = Number(n);
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return v.toFixed(v < 10 && i > 0 ? 1 : 0) + ' ' + u[i];
+}
+
+//===========================================================================
+// OAuth (Google Identity Services)
+//===========================================================================
+function initTokenClient() {
+  if (!window.google || !google.accounts || !google.accounts.oauth2) {
+    return false;
+  }
+  state.tokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: state.clientId,
+    scope: SCOPE,
+    callback: (resp) => {
+      if (resp.error) {
+        toast('Sign-in failed: ' + resp.error);
+        return;
+      }
+      state.accessToken = resp.access_token;
+      state.tokenExpiresAt = Date.now() + (resp.expires_in - 60) * 1000;
+      onSignedIn();
+    },
+  });
+  return true;
+}
+
+function ensureToken() {
+  if (state.accessToken && Date.now() < state.tokenExpiresAt) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    if (!state.tokenClient) {
+      if (!initTokenClient()) {
+        reject(new Error('GIS not loaded'));
+        return;
+      }
+    }
+    const orig = state.tokenClient.callback;
+    state.tokenClient.callback = (resp) => {
+      orig(resp);
+      if (resp.error) reject(new Error(resp.error));
+      else resolve();
+    };
+    state.tokenClient.requestAccessToken({ prompt: '' });
+  });
+}
+
+function onSignedIn() {
+  showScreen('browser-screen');
+  state.folderStack = [{ id: 'root', name: 'My Drive' }];
+  loadCurrentFolder();
+}
+
+function signOut() {
+  if (state.accessToken) {
+    google.accounts.oauth2.revoke(state.accessToken, () => {});
+  }
+  state.accessToken = null;
+  state.tokenExpiresAt = 0;
+  showScreen('signin-screen');
+}
+
+//===========================================================================
+// Drive client
+//===========================================================================
+async function driveFetch(url, init = {}) {
+  await ensureToken();
+  const headers = Object.assign({}, init.headers, {
+    'Authorization': 'Bearer ' + state.accessToken,
+  });
+  const resp = await fetch(url, Object.assign({}, init, { headers }));
+  if (resp.status === 401) {
+    state.accessToken = null;
+    await ensureToken();
+    headers.Authorization = 'Bearer ' + state.accessToken;
+    return fetch(url, Object.assign({}, init, { headers }));
+  }
+  return resp;
+}
+
+async function listFolder(folderId) {
+  const q = `'${folderId}' in parents and trashed = false`;
+  const params = new URLSearchParams({
+    q,
+    fields: 'files(id,name,mimeType,size,modifiedTime)',
+    pageSize: '1000',
+    orderBy: 'folder,name',
+    spaces: 'drive',
+    supportsAllDrives: 'true',
+    includeItemsFromAllDrives: 'true',
+  });
+  const resp = await driveFetch('https://www.googleapis.com/drive/v3/files?' + params);
+  if (!resp.ok) throw new Error('Drive list failed: ' + resp.status);
+  const data = await resp.json();
+  return data.files || [];
+}
+
+async function getFileSize(fileId) {
+  const resp = await driveFetch(
+    `https://www.googleapis.com/drive/v3/files/${fileId}?fields=size,name&supportsAllDrives=true`
+  );
+  if (!resp.ok) throw new Error('Drive metadata failed: ' + resp.status);
+  const data = await resp.json();
+  return parseInt(data.size, 10);
+}
+
+async function fetchRange(fileId, start, end) {
+  const url = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&supportsAllDrives=true`;
+  const resp = await driveFetch(url, {
+    headers: { 'Range': `bytes=${start}-${end}` },
+  });
+  if (!resp.ok && resp.status !== 206) {
+    throw new Error('Drive range fetch failed: ' + resp.status);
+  }
+  return new Uint8Array(await resp.arrayBuffer());
+}
+
+//===========================================================================
+// ZIP streaming reader
+// - Parses EOCD from tail to locate central directory.
+// - Supports ZIP64 and Shift_JIS / UTF-8 filenames.
+// - Decompresses individual entries on demand using DecompressionStream.
+//===========================================================================
+class ZipReader {
+  constructor(fileId, fileSize) {
+    this.fileId = fileId;
+    this.fileSize = fileSize;
+    this.entries = null;
+  }
+
+  async open() {
+    const tailMax = 65557; // 22 + 0xFFFF comment
+    const tailSize = Math.min(this.fileSize, tailMax);
+    const tailStart = this.fileSize - tailSize;
+    const tail = await fetchRange(this.fileId, tailStart, this.fileSize - 1);
+    const tv = new DataView(tail.buffer, tail.byteOffset, tail.byteLength);
+
+    // Find EOCD signature (0x06054b50) scanning from the end
+    let eocdLocal = -1;
+    for (let i = tail.length - 22; i >= 0; i--) {
+      if (tv.getUint32(i, true) === 0x06054b50) { eocdLocal = i; break; }
+    }
+    if (eocdLocal < 0) throw new Error('EOCD not found (not a ZIP?)');
+
+    let cdSize = tv.getUint32(eocdLocal + 12, true);
+    let cdOffset = tv.getUint32(eocdLocal + 16, true);
+    let totalEntries = tv.getUint16(eocdLocal + 10, true);
+
+    // ZIP64 detection
+    if (cdSize === 0xFFFFFFFF || cdOffset === 0xFFFFFFFF || totalEntries === 0xFFFF) {
+      const locLocal = eocdLocal - 20;
+      if (locLocal >= 0 && tv.getUint32(locLocal, true) === 0x07064b50) {
+        const z64Off = Number(tv.getBigUint64(locLocal + 8, true));
+        const z64Buf = await fetchRange(this.fileId, z64Off, z64Off + 55);
+        const z64v = new DataView(z64Buf.buffer, z64Buf.byteOffset, z64Buf.byteLength);
+        if (z64v.getUint32(0, true) !== 0x06064b50) {
+          throw new Error('ZIP64 EOCD signature mismatch');
+        }
+        totalEntries = Number(z64v.getBigUint64(32, true));
+        cdSize = Number(z64v.getBigUint64(40, true));
+        cdOffset = Number(z64v.getBigUint64(48, true));
+      }
+    }
+
+    // Fetch central directory (use tail if it covers it)
+    let cd;
+    if (cdOffset >= tailStart) {
+      cd = tail.subarray(cdOffset - tailStart, cdOffset - tailStart + cdSize);
+    } else {
+      cd = await fetchRange(this.fileId, cdOffset, cdOffset + cdSize - 1);
+    }
+    const cv = new DataView(cd.buffer, cd.byteOffset, cd.byteLength);
+
+    const entries = [];
+    let p = 0;
+    const utf8 = new TextDecoder('utf-8');
+    let sjis;
+    try { sjis = new TextDecoder('shift_jis', { fatal: false }); } catch { sjis = utf8; }
+
+    for (let i = 0; i < totalEntries; i++) {
+      if (p + 46 > cd.length) break;
+      if (cv.getUint32(p, true) !== 0x02014b50) break;
+      const gpFlag = cv.getUint16(p + 8, true);
+      const method = cv.getUint16(p + 10, true);
+      let compSize = cv.getUint32(p + 20, true);
+      let uncompSize = cv.getUint32(p + 24, true);
+      const nameLen = cv.getUint16(p + 28, true);
+      const extraLen = cv.getUint16(p + 30, true);
+      const commentLen = cv.getUint16(p + 32, true);
+      let lhOff = cv.getUint32(p + 42, true);
+
+      const nameBytes = cd.subarray(p + 46, p + 46 + nameLen);
+      const extraBytes = cd.subarray(p + 46 + nameLen, p + 46 + nameLen + extraLen);
+
+      if (compSize === 0xFFFFFFFF || uncompSize === 0xFFFFFFFF || lhOff === 0xFFFFFFFF) {
+        const ev = new DataView(extraBytes.buffer, extraBytes.byteOffset, extraBytes.byteLength);
+        let ep = 0;
+        while (ep + 4 <= extraBytes.length) {
+          const tag = ev.getUint16(ep, true);
+          const sz = ev.getUint16(ep + 2, true);
+          if (tag === 0x0001) {
+            let z = ep + 4;
+            if (uncompSize === 0xFFFFFFFF) { uncompSize = Number(ev.getBigUint64(z, true)); z += 8; }
+            if (compSize === 0xFFFFFFFF) { compSize = Number(ev.getBigUint64(z, true)); z += 8; }
+            if (lhOff === 0xFFFFFFFF) { lhOff = Number(ev.getBigUint64(z, true)); z += 8; }
+            break;
+          }
+          ep += 4 + sz;
+        }
+      }
+
+      const name = (gpFlag & 0x0800) ? utf8.decode(nameBytes) : sjis.decode(nameBytes);
+      const encrypted = !!(gpFlag & 0x0001);
+
+      // Skip directory entries and zero-byte entries
+      if (!name.endsWith('/') && uncompSize > 0) {
+        entries.push({ name, method, compSize, uncompSize, lhOff, encrypted });
+      }
+      p += 46 + nameLen + extraLen + commentLen;
+    }
+
+    this.entries = entries;
+    return entries;
+  }
+
+  async readEntry(entry) {
+    if (entry.encrypted) throw new Error('Encrypted ZIP entries are not supported');
+    // Local file header is variable-length; read a generous chunk first
+    const lhBuf = await fetchRange(this.fileId, entry.lhOff, entry.lhOff + 29);
+    const lv = new DataView(lhBuf.buffer, lhBuf.byteOffset, lhBuf.byteLength);
+    if (lv.getUint32(0, true) !== 0x04034b50) throw new Error('Local header signature mismatch');
+    const nameLen = lv.getUint16(26, true);
+    const extraLen = lv.getUint16(28, true);
+    const dataStart = entry.lhOff + 30 + nameLen + extraLen;
+    const dataEnd = dataStart + entry.compSize - 1;
+
+    const compBytes = await fetchRange(this.fileId, dataStart, dataEnd);
+
+    if (entry.method === 0) return compBytes;
+    if (entry.method === 8) {
+      const stream = new Blob([compBytes]).stream()
+        .pipeThrough(new DecompressionStream('deflate-raw'));
+      const buf = await new Response(stream).arrayBuffer();
+      return new Uint8Array(buf);
+    }
+    throw new Error('Unsupported compression method: ' + entry.method);
+  }
+}
+
+//===========================================================================
+// File browser
+//===========================================================================
+const ZIP_EXT = /\.(zip|cbz)$/i;
+const IMAGE_EXT = /\.(jpe?g|png|webp|gif|bmp|avif)$/i;
+
+function isFolder(f) { return f.mimeType === 'application/vnd.google-apps.folder'; }
+function isZip(f)    { return ZIP_EXT.test(f.name) || f.mimeType === 'application/zip'; }
+
+async function loadCurrentFolder() {
+  const cur = state.folderStack[state.folderStack.length - 1];
+  $('breadcrumb').innerHTML = state.folderStack
+    .map((f, i) => i === state.folderStack.length - 1
+      ? `<span>${escapeHtml(f.name)}</span>`
+      : escapeHtml(f.name))
+    .join(' / ');
+  $('file-list').innerHTML = '<div class="spinner"></div>';
+  try {
+    const all = await listFolder(cur.id);
+    const filtered = all.filter(f => isFolder(f) || isZip(f));
+    filtered.sort((a, b) => {
+      if (isFolder(a) !== isFolder(b)) return isFolder(a) ? -1 : 1;
+      return naturalCompare(a.name, b.name);
+    });
+    state.currentFiles = filtered;
+    renderFileList(filtered);
+  } catch (e) {
+    $('file-list').innerHTML = `<div class="empty-state">Error: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+
+function renderFileList(files) {
+  const list = $('file-list');
+  if (!files.length) {
+    list.innerHTML = '<div class="empty-state">No folders or ZIP files here.</div>';
+    return;
+  }
+  const folderIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>`;
+  const zipIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M12 11v6M9 14h6"/></svg>`;
+
+  list.innerHTML = files.map((f, i) => {
+    const folder = isFolder(f);
+    const sub = folder ? 'Folder' : fmtBytes(f.size);
+    return `
+      <div class="file-row ${folder ? 'folder' : 'zip'}" data-i="${i}">
+        <div class="icon">${folder ? folderIcon : zipIcon}</div>
+        <div class="meta">
+          <div class="name">${escapeHtml(f.name)}</div>
+          <div class="sub">${escapeHtml(sub)}</div>
+        </div>
+      </div>`;
+  }).join('');
+
+  list.querySelectorAll('.file-row').forEach(row => {
+    row.addEventListener('click', () => {
+      const f = files[Number(row.dataset.i)];
+      if (isFolder(f)) {
+        state.folderStack.push({ id: f.id, name: f.name });
+        loadCurrentFolder();
+      } else {
+        openZip(f);
+      }
+    });
+  });
+}
+
+function goBack() {
+  if (state.folderStack.length > 1) {
+    state.folderStack.pop();
+    loadCurrentFolder();
+  } else {
+    toast('Already at top');
+  }
+}
+
+//===========================================================================
+// Reader
+//===========================================================================
+class Reader {
+  constructor(file) {
+    this.file = file;
+    this.zip = null;
+    this.imageEntries = [];
+    this.bitmapCache = new Map(); // index -> blobUrl (LRU)
+    this.cacheLimit = 12;
+    this.currentIndex = 0;
+    this.loading = new Map(); // index -> Promise
+  }
+
+  async start() {
+    $('reader-title').textContent = this.file.name;
+    $('page-counter').textContent = 'Loading…';
+    $('reader-pages').innerHTML =
+      '<div class="page-slot"><div class="placeholder"><div class="spinner"></div>Reading archive…</div></div>';
+    showScreen('reader-screen');
+
+    try {
+      const size = parseInt(this.file.size, 10) || await getFileSize(this.file.id);
+      this.zip = new ZipReader(this.file.id, size);
+      await this.zip.open();
+      this.imageEntries = this.zip.entries
+        .filter(e => IMAGE_EXT.test(e.name))
+        .sort((a, b) => naturalCompare(a.name, b.name));
+
+      if (!this.imageEntries.length) {
+        $('reader-pages').innerHTML =
+          '<div class="page-slot"><div class="placeholder">No images found in this archive.</div></div>';
+        return;
+      }
+
+      const saved = loadProgress(this.file.id);
+      this.currentIndex = saved && saved < this.imageEntries.length ? saved : 0;
+
+      this.renderSlots();
+      requestAnimationFrame(() => {
+        this.scrollToIndex(this.currentIndex, false);
+        this.updateCounter();
+        this.preload(this.currentIndex);
+      });
+    } catch (e) {
+      console.error(e);
+      $('reader-pages').innerHTML =
+        `<div class="page-slot"><div class="placeholder">Error: ${escapeHtml(e.message)}</div></div>`;
+    }
+  }
+
+  renderSlots() {
+    const container = $('reader-pages');
+    // RTL via flex-direction: row-reverse — slot order in DOM is page 0..N-1,
+    // but visually rendered right-to-left. ScrollIntoView still works per slot.
+    container.innerHTML = this.imageEntries.map((_, i) => `
+      <div class="page-slot" data-i="${i}">
+        <div class="placeholder"><div class="spinner"></div></div>
+      </div>
+    `).join('');
+
+    // Track current page via scroll
+    container.addEventListener('scroll', () => {
+      const w = container.clientWidth;
+      // Because of row-reverse, scroll position math is mirrored:
+      // visible page index = round((maxScroll - scrollLeft) / w)  in some browsers
+      // but in practice, scrollLeft directly reflects logical position when using
+      // row-reverse with LTR document. We use the closest snapped slot.
+      const slots = container.querySelectorAll('.page-slot');
+      let bestI = this.currentIndex;
+      let bestDist = Infinity;
+      const cRect = container.getBoundingClientRect();
+      slots.forEach(slot => {
+        const r = slot.getBoundingClientRect();
+        const d = Math.abs(r.left + r.width / 2 - (cRect.left + cRect.width / 2));
+        if (d < bestDist) { bestDist = d; bestI = Number(slot.dataset.i); }
+      });
+      if (bestI !== this.currentIndex) {
+        this.currentIndex = bestI;
+        this.updateCounter();
+        this.preload(bestI);
+        saveProgress(this.file.id, bestI);
+      }
+    }, { passive: true });
+  }
+
+  updateCounter() {
+    $('page-counter').textContent =
+      (this.currentIndex + 1) + ' / ' + this.imageEntries.length;
+  }
+
+  scrollToIndex(i, smooth = true) {
+    const slot = document.querySelector(`.page-slot[data-i="${i}"]`);
+    if (slot) {
+      slot.scrollIntoView({ behavior: smooth ? 'smooth' : 'instant', inline: 'start', block: 'nearest' });
+    }
+  }
+
+  next() {
+    if (this.currentIndex < this.imageEntries.length - 1) {
+      this.currentIndex++;
+      this.scrollToIndex(this.currentIndex);
+    }
+  }
+
+  prev() {
+    if (this.currentIndex > 0) {
+      this.currentIndex--;
+      this.scrollToIndex(this.currentIndex);
+    }
+  }
+
+  async preload(centerIndex) {
+    // Load center, then ±1, ±2
+    const indices = [
+      centerIndex,
+      centerIndex + 1, centerIndex - 1,
+      centerIndex + 2, centerIndex - 2,
+    ].filter(i => i >= 0 && i < this.imageEntries.length);
+    for (const i of indices) {
+      this.loadPage(i); // fire-and-forget
+    }
+  }
+
+  async loadPage(index) {
+    if (this.bitmapCache.has(index)) {
+      // Move to MRU
+      const url = this.bitmapCache.get(index);
+      this.bitmapCache.delete(index);
+      this.bitmapCache.set(index, url);
+      this.attachToSlot(index, url);
+      return;
+    }
+    if (this.loading.has(index)) return this.loading.get(index);
+
+    const p = (async () => {
+      try {
+        const entry = this.imageEntries[index];
+        const bytes = await this.zip.readEntry(entry);
+        const ext = entry.name.split('.').pop().toLowerCase();
+        const mime = ext === 'png' ? 'image/png'
+                   : ext === 'webp' ? 'image/webp'
+                   : ext === 'gif' ? 'image/gif'
+                   : ext === 'bmp' ? 'image/bmp'
+                   : ext === 'avif' ? 'image/avif'
+                   : 'image/jpeg';
+        const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
+        this.bitmapCache.set(index, url);
+        this.evictCache();
+        this.attachToSlot(index, url);
+      } catch (e) {
+        const slot = document.querySelector(`.page-slot[data-i="${index}"]`);
+        if (slot) {
+          slot.innerHTML = `<div class="placeholder">Error: ${escapeHtml(e.message)}</div>`;
+        }
+      } finally {
+        this.loading.delete(index);
+      }
+    })();
+
+    this.loading.set(index, p);
+    return p;
+  }
+
+  attachToSlot(index, url) {
+    const slot = document.querySelector(`.page-slot[data-i="${index}"]`);
+    if (slot && !slot.querySelector('img')) {
+      slot.innerHTML = `<img alt="" src="${url}" loading="lazy">`;
+    }
+  }
+
+  evictCache() {
+    while (this.bitmapCache.size > this.cacheLimit) {
+      const oldestKey = this.bitmapCache.keys().next().value;
+      const url = this.bitmapCache.get(oldestKey);
+      URL.revokeObjectURL(url);
+      this.bitmapCache.delete(oldestKey);
+      // Reset its slot to placeholder so memory is freed
+      const slot = document.querySelector(`.page-slot[data-i="${oldestKey}"]`);
+      if (slot) {
+        slot.innerHTML = '<div class="placeholder"><div class="spinner"></div></div>';
+      }
+    }
+  }
+
+  destroy() {
+    for (const url of this.bitmapCache.values()) URL.revokeObjectURL(url);
+    this.bitmapCache.clear();
+    this.loading.clear();
+  }
+}
+
+function openZip(file) {
+  if (state.reader) state.reader.destroy();
+  state.reader = new Reader(file);
+  state.reader.start();
+}
+
+function closeReader() {
+  if (state.reader) {
+    state.reader.destroy();
+    state.reader = null;
+  }
+  showScreen('browser-screen');
+}
+
+//===========================================================================
+// Reading-progress persistence
+//===========================================================================
+function loadProgressMap() {
+  try {
+    return JSON.parse(localStorage.getItem(STORAGE_PROGRESS) || '{}');
+  } catch { return {}; }
+}
+function saveProgress(fileId, index) {
+  const m = loadProgressMap();
+  m[fileId] = index;
+  // Keep map bounded
+  const keys = Object.keys(m);
+  if (keys.length > 200) {
+    delete m[keys[0]];
+  }
+  localStorage.setItem(STORAGE_PROGRESS, JSON.stringify(m));
+}
+function loadProgress(fileId) {
+  return loadProgressMap()[fileId];
+}
+
+//===========================================================================
+// UI wiring
+//===========================================================================
+function wireSignIn() {
+  const input = $('client-id');
+  const btn = $('signin-btn');
+  const saved = localStorage.getItem(STORAGE_CLIENT_ID);
+  if (saved) input.value = saved;
+
+  const validate = () => {
+    const v = input.value.trim();
+    btn.disabled = !v.includes('.apps.googleusercontent.com');
+  };
+  input.addEventListener('input', validate);
+  validate();
+
+  btn.addEventListener('click', () => {
+    const v = input.value.trim();
+    state.clientId = v;
+    localStorage.setItem(STORAGE_CLIENT_ID, v);
+    if (!initTokenClient()) {
+      toast('Google library still loading — try again in a moment');
+      return;
+    }
+    state.tokenClient.requestAccessToken({ prompt: 'consent' });
+  });
+}
+
+function wireBrowser() {
+  $('back-btn').addEventListener('click', goBack);
+  $('signout-btn').addEventListener('click', signOut);
+}
+
+function wireReader() {
+  $('reader-close').addEventListener('click', closeReader);
+
+  // Tap zones — left = next (RTL), right = prev, middle = toggle overlay
+  document.querySelectorAll('#reader-zones > div').forEach(zone => {
+    zone.addEventListener('click', () => {
+      const action = zone.dataset.action;
+      if (!state.reader) return;
+      if (action === 'next') state.reader.next();
+      else if (action === 'prev') state.reader.prev();
+      else $('reader-overlay').classList.toggle('hidden-overlay');
+    });
+  });
+
+  // Keyboard
+  document.addEventListener('keydown', (e) => {
+    if ($('reader-screen').classList.contains('hidden')) return;
+    if (e.key === 'Escape') closeReader();
+    else if (e.key === 'ArrowLeft') state.reader && state.reader.next(); // RTL
+    else if (e.key === 'ArrowRight') state.reader && state.reader.prev();
+  });
+
+  // Auto-hide overlay after a moment
+  setInterval(() => {
+    if (!$('reader-screen').classList.contains('hidden')) {
+      const overlay = $('reader-overlay');
+      if (!overlay._hovered && !overlay.classList.contains('hidden-overlay')) {
+        // Don't auto-hide — keep visible until user toggles
+      }
+    }
+  }, 1000);
+}
+
+//===========================================================================
+// Init
+//===========================================================================
+window.addEventListener('DOMContentLoaded', () => {
+  wireSignIn();
+  wireBrowser();
+  wireReader();
+});
+</script>
+</body>
+</html>
