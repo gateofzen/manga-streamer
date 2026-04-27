@@ -1,129 +1,116 @@
-# Manga Streamer (Web)
+# Manga Streamer Web
 
-Google Drive 上の漫画 ZIP/CBZ ファイルを **ダウンロードせずにストリーミングで** 読むためのブラウザアプリ。HTTP Range request で ZIP の Central Directory と必要なページのみを取得し、`DecompressionStream` で展開する。
+Browser-based manga streaming reader for ZIP/CBZ archives stored on Google Drive.
+Single-file HTML — deploy to GitHub Pages, no build step.
 
-`index.html` 一枚で完結。GitHub Pages にそのまま置ける。
+## Features
 
----
+- **HTTP Range streaming** of ZIP central directory + per-page entries (no full download)
+- **DEFLATE / Stored** support via native `DecompressionStream('deflate-raw')`
+- **ZIP64 + Shift_JIS / UTF-8** filename decoding
+- **RTL paging** with scroll-snap (right tap = previous page)
+- **Single page / two-page spread** view toggle (book-style with cover-alone convention)
+- **Cross-device progress sync** via Drive `appDataFolder` (hidden per-app folder)
+- **Drive-wide file search** by name
+- LRU image cache (16 pages) + ±2 slot preload
 
-## 仕様
+Not supported: RAR/CBR, encrypted ZIPs.
 
-- **対応形式**: ZIP / CBZ（DEFLATE / Stored）、ZIP64、Shift_JIS / UTF-8 ファイル名
-- **画像形式**: JPEG / PNG / WebP / AVIF / GIF / BMP
-- **読書方向**: 右開き（manga RTL）。タップ左 = 次ページ、タップ右 = 前ページ
-- **キャッシュ**: 画像 12 ページ分の LRU、Drive ファイル ID ごとに最終ページ位置を localStorage に保存
-- **対応ブラウザ**: Chrome / Edge / Safari / Firefox いずれも最新版（`DecompressionStream('deflate-raw')` 対応必須）
+## Quick start
 
-> RAR / 7z / 暗号化 ZIP は **非対応**（Android 版とは異なる）
+1. Drop `index.html` somewhere (GitHub Pages, local file server, etc.)
+2. Set up a Google OAuth Web Client ID (see below)
+3. Open the page, paste the Client ID, sign in
 
----
+## Google Cloud setup
 
-## セットアップ
+If you already have an Android version of Manga Streamer set up, **reuse the same
+project** — just add a Web Application Client ID alongside your existing Android one.
 
-### 1. Google Cloud Console で OAuth クライアント ID を作成
+In Google Cloud Console:
 
-1. <https://console.cloud.google.com/> にアクセス、適当なプロジェクトを作成（既存のものでも可）
-2. **APIs & Services → Library** から `Google Drive API` を検索して **Enable**
-3. **APIs & Services → OAuth consent screen** で
-   - User Type: `External`
-   - App name など最低限を入力
-   - **Scopes** で `.../auth/drive.readonly` を追加
-   - **Test users** に自分の Google アカウントを追加
-4. **APIs & Services → Credentials → Create Credentials → OAuth client ID**
-   - Application type: **Web application**
-   - **Authorized JavaScript origins** にこのページの origin を追加（例: `https://yourname.github.io`、ローカル動作確認用に `http://localhost:8000` も）
-   - 作成すると `xxxxxx.apps.googleusercontent.com` の形式の Client ID が発行される
+1. Enable **Drive API**
+2. **Google Auth Platform** → Branding/Audience: External, add yourself as Test user
+3. **Google Auth Platform → Data Access** → add scopes:
+   - `https://www.googleapis.com/auth/drive.readonly` (read manga files)
+   - `https://www.googleapis.com/auth/drive.appdata` (cross-device progress sync)
+4. **Google Auth Platform → Clients** → Create Client → Application type: **Web application**
+   - **Authorized JavaScript origins**: the origin where you'll host the app
+     (e.g. `https://gateofzen.github.io`, or `http://localhost:8080` for local dev)
+   - SHA-1 fingerprint is **not** needed for Web clients
+5. Copy the Client ID into the app's sign-in screen
 
-### 2. ホスティング
+> **Existing Android-version users**: the new `drive.appdata` scope means the
+> consent screen will ask for permission to manage app-specific data on Drive.
+> You'll need to approve once.
 
-#### GitHub Pages の場合
+## How features work
 
-```bash
-# 適当なリポジトリにコミット
-git init
-git add index.html README.md
-git commit -m "Initial"
-git remote add origin git@github.com:yourname/manga-streamer-web.git
-git push -u origin main
+### Single / spread view toggle
+
+A button in the reader top bar (or **V** key) switches between:
+
+- **Single**: one page per scroll snap
+- **Spread**: book-style, cover alone followed by `[1,2], [3,4], ...` pairs.
+  Within a spread, the lower-numbered page sits on the **right** (RTL convention).
+
+The choice persists globally in `localStorage`. When toggling mid-read, the
+current page is preserved (the new view scrolls to the slot containing it).
+
+### Cross-device progress sync
+
+Read progress is stored as a single JSON file `progress.json` inside Google
+Drive's hidden **appDataFolder** (per-app, invisible in normal Drive UI).
+
+```json
+{
+  "version": 1,
+  "files": {
+    "<driveFileId>": { "page": 42, "updated": 1714298400000 }
+  }
+}
 ```
 
-リポジトリの **Settings → Pages** で `main` ブランチをソースに設定。`https://yourname.github.io/manga-streamer-web/` で公開される。**この URL の origin（`https://yourname.github.io`）を上記 OAuth の Authorized JavaScript origins に必ず追加すること。**
+- On sign-in: cloud progress is pulled, merged with any local data, and cached
+  to localStorage as a mirror.
+- Page changes: written to localStorage immediately; cloud write is debounced
+  (3 s) and flushed when the reader closes.
+- Returning to the browser tab (`visibilitychange`) auto-refreshes from cloud,
+  so progress made on another device shows up in the file list.
+- A small red dot next to the breadcrumb pulses while syncing.
 
-#### ローカル動作確認
+To wipe cloud progress: delete `progress.json` from the Drive **App Data** view
+in Google Drive's settings (Settings → Manage apps → Manga Streamer → Disconnect).
 
-```bash
-cd manga-streamer-web
-python3 -m http.server 8000
-# http://localhost:8000/ を開く
-```
+### Drive search
 
-`http://localhost:8000` を Authorized JavaScript origins に追加しておく。
+Click the magnifying glass in the top bar (or it's there always; toggle
+swaps breadcrumb ↔ search input). Press Enter to query Drive globally with
+`name contains '<term>'`. Results show ZIP/CBZ files first, then folders.
 
-### 3. 初回サインイン
+- Click a ZIP → opens in reader
+- Click a folder → navigates into it (search context cleared)
+- Esc / × → exits search, back to folder browsing
 
-公開した URL を開く → Client ID を貼り付け → **Sign in with Google** → Drive 読み取り権限を許可。Client ID は localStorage に保存されるので次回以降は不要。
+## Keyboard shortcuts (reader)
 
----
-
-## 使い方
-
-| 操作 | アクション |
+| Key | Action |
 |---|---|
-| ファイルブラウザ | フォルダをタップで階層移動。ZIP/CBZ をタップでリーダー起動 |
-| リーダー: 画面左タップ | 次ページ |
-| リーダー: 画面右タップ | 前ページ |
-| リーダー: 画面中央タップ | 上部オーバーレイの表示切替 |
-| リーダー: スワイプ右 | 次ページ（RTL の自然な方向） |
-| キーボード ←  | 次ページ |
-| キーボード → | 前ページ |
-| キーボード Esc | リーダーを閉じる |
+| ← | Next page (RTL) |
+| → | Previous page |
+| V | Toggle single / spread |
+| Esc | Close reader |
 
-最後に開いていたページは Drive ファイル ID 単位で記憶され、次回同じファイルを開くと続きから表示される。
-
----
-
-## アーキテクチャ
+## File layout
 
 ```
-[GIS OAuth] ─ access_token ─┐
-                            │
-                            ▼
-              fetch(Drive API, Range: bytes=...)
-                            │
-                            ▼
-      ┌───────── ZipReader ─────────┐
-      │  open():   末尾 64KB → EOCD  │
-      │            → Central Directory パース
-      │  readEntry(): Local Header → 圧縮データ
-      │            → DecompressionStream('deflate-raw')
-      └─────────────────────────────┘
-                            │
-                            ▼
-              Blob → object URL → <img>
-                            │
-                            ▼
-        flex row-reverse + scroll-snap で RTL ページング
+manga-streamer-web/
+├── index.html   # everything (HTML + CSS + JS, ~1100 lines)
+└── README.md
 ```
 
-Android 版の `ZipStreamReader` + `HttpRangeSource` をブラウザ API に置き換えたもの。EOCD 探索、ZIP64 対応、Shift_JIS デコード、選択的 entry 読み出しのロジックは同じ思想。
+## Privacy
 
----
-
-## トラブルシューティング
-
-| 症状 | 原因 / 対処 |
-|---|---|
-| `redirect_uri_mismatch` / `idpiframe_initialization_failed` | Authorized JavaScript origins に現在の URL の origin が登録されていない |
-| サインイン後に何も起こらない | OAuth consent screen で `drive.readonly` スコープを追加していない |
-| `403 forbidden` | アプリが Test mode のまま、自分のアカウントが Test users に登録されていない |
-| 「EOCD not found」 | ZIP 形式ではないファイル（自己解凍 EXE、RAR、暗号化アーカイブなど） |
-| 「Encrypted ZIP entries are not supported」 | パスワード付き ZIP は非対応 |
-| 「Unsupported compression method: N」 | DEFLATE / Stored 以外の方式（BZIP2 など）は未対応 |
-| 巨大ファイルで読み込みが遅い | Range request 1 回ごとに往復が発生する。Drive 側のレイテンシ次第（通常 100-300ms / page） |
-| トークンが切れる | 1 時間でアクセストークンが期限切れ。コード内で自動的にサイレント再取得を試みるが、失敗したら再度サインイン |
-
----
-
-## ライセンス
-
-MIT
+The Client ID, view mode preference, and a mirror of progress data are stored in
+`localStorage`. Progress also lives in your own Drive's app data folder. Nothing
+is sent anywhere except `googleapis.com`.
