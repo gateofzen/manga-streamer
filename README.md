@@ -129,7 +129,8 @@ Reader optimizations (chosen for fast page-flipping use cases):
 | ← | Next page (RTL) |
 | → | Previous page |
 | V | Toggle single / spread |
-| Esc | Close reader |
+| F | Toggle fullscreen |
+| Esc | Close reader (or exit fullscreen if active) |
 
 ## File layout
 
