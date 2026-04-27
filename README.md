@@ -12,7 +12,9 @@ Single-file HTML — deploy to GitHub Pages, no build step.
 - **Single page / two-page spread** view toggle (book-style with cover-alone convention)
 - **Cross-device progress sync** via Drive `appDataFolder` (hidden per-app folder)
 - **Drive-wide file search** by name
-- LRU image cache (16 pages) + ±2 slot preload
+- **Reading history** screen sorted by recency
+- **Aggressive preload** — 8 slots ahead + 2 behind, 40-page LRU cache,
+  single-Range-request page fetch (halved RTT vs. naive)
 
 Not supported: RAR/CBR, encrypted ZIPs.
 
@@ -91,6 +93,34 @@ swaps breadcrumb ↔ search input). Press Enter to query Drive globally with
 - Click a ZIP → opens in reader
 - Click a folder → navigates into it (search context cleared)
 - Esc / × → exits search, back to folder browsing
+
+### Reading history
+
+Click the clock icon in the top bar. Shows every file you've opened,
+sorted by most recent. Each entry shows current page, total pages, percent
+read, and relative time (たった今 / 5分前 / 3時間前 / 2日前 / date).
+
+The metadata (name, size, total pages) is stored alongside progress in
+`progress.json`, so the history is **available cross-device** without any
+extra Drive API calls.
+
+Click a history entry to jump back into the reader at the saved page.
+Files renamed/deleted from Drive after they were read still appear in
+history with their old name (the open will fail; that's the signal to
+clean up). To clear history: delete `progress.json` from Drive's
+**App Data** view (Settings → Manage apps → Manga Streamer → Disconnect).
+
+### Performance: preload & cache
+
+Reader optimizations (chosen for fast page-flipping use cases):
+
+- **8 slots forward, 2 backward** preload (asymmetric — reading mostly
+  goes forward). In spread mode this is up to 16 pages of forward buffer.
+- **40-page LRU cache** of decoded blob URLs, evicted oldest-first.
+- **Single Range request per page**: speculatively fetches local header
+  + compressed data in one call (assumes `nameLen + extraLen ≤ 256`,
+  falls back to a second fetch only if the assumption fails). This
+  halves round-trip latency vs. the naive 2-request approach.
 
 ## Keyboard shortcuts (reader)
 
