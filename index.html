@@ -297,6 +297,13 @@
         <button class="search-clear" id="search-clear" title="Clear">✕</button>
       </div>
     </div>
+    <button class="icon-btn" id="history-btn" title="History">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 12a9 9 0 1 0 9-9c-2.4 0-4.8 1-6.4 2.6L3 8"/>
+        <polyline points="3 3 3 8 8 8"/>
+        <polyline points="12 7 12 12 15 14"/>
+      </svg>
+    </button>
     <button class="icon-btn" id="search-btn" title="Search">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="11" cy="11" r="8"/><path d="M21 21l-4.3-4.3"/>
@@ -361,6 +368,8 @@ const state = {
   searching: false,
   searchQuery: '',
   searchResults: [],
+  // History
+  history: false,
 };
 
 const VIEW_MODE_ICONS = {
@@ -402,6 +411,17 @@ function escapeHtml(s) {
 function showSync(on) {
   const el = $('sync-dot');
   if (el) el.classList.toggle('active', !!on);
+}
+
+function relTime(ts) {
+  if (!ts) return '';
+  const diff = Date.now() - ts;
+  const min = 60_000, hour = 60 * min, day = 24 * hour;
+  if (diff < min) return 'たった今';
+  if (diff < hour) return Math.floor(diff / min) + '分前';
+  if (diff < day) return Math.floor(diff / hour) + '時間前';
+  if (diff < 7 * day) return Math.floor(diff / day) + '日前';
+  return new Date(ts).toLocaleDateString('ja-JP');
 }
 
 //===========================================================================
@@ -671,8 +691,19 @@ function getProgress(fileId) {
   return e ? e.page : null;
 }
 
-function setProgress(fileId, page) {
-  state.progress.files[fileId] = { page, updated: Date.now() };
+function setProgress(fileId, page, meta) {
+  const existing = state.progress.files[fileId] || {};
+  const next = {
+    ...existing,
+    page,
+    updated: Date.now(),
+  };
+  if (meta) {
+    if (meta.name) next.name = meta.name;
+    if (meta.size != null) next.size = meta.size;
+    if (meta.totalPages != null) next.totalPages = meta.totalPages;
+  }
+  state.progress.files[fileId] = next;
   saveLocalMirror();
   scheduleProgressSave();
 }
@@ -719,10 +750,10 @@ async function refreshProgress() {
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) return;
   if (!state.accessToken || !state.progressFileId) return;
-  // Only auto-refresh in browser screen, not while reading
   if (!$('browser-screen').classList.contains('hidden')) {
     refreshProgress().then(() => {
-      if (state.searching) renderFileList(state.searchResults);
+      if (state.history) renderHistory();
+      else if (state.searching) renderFileList(state.searchResults);
       else renderFileList(state.currentFiles);
     });
   }
@@ -833,22 +864,36 @@ class ZipReader {
 
   async readEntry(entry) {
     if (entry.encrypted) throw new Error('Encrypted ZIP entries are not supported');
-    const lhBuf = await fetchRange(this.fileId, entry.lhOff, entry.lhOff + 29);
-    const lv = new DataView(lhBuf.buffer, lhBuf.byteOffset, lhBuf.byteLength);
-    if (lv.getUint32(0, true) !== 0x04034b50) throw new Error('Local header signature mismatch');
-    const nameLen = lv.getUint16(26, true);
-    const extraLen = lv.getUint16(28, true);
-    const dataStart = entry.lhOff + 30 + nameLen + extraLen;
-    const dataEnd = dataStart + entry.compSize - 1;
 
-    const compBytes = await fetchRange(this.fileId, dataStart, dataEnd);
+    // Speculative single-range fetch: assume name+extra ≤ 256 bytes, get
+    // local header AND compressed data in one Range request. Halves RTT.
+    const ASSUMED_NAME_EXTRA = 256;
+    const speculativeEnd = entry.lhOff + 30 + ASSUMED_NAME_EXTRA + entry.compSize - 1;
+    const fetchEnd = Math.min(speculativeEnd, this.fileSize - 1);
+    const buf = await fetchRange(this.fileId, entry.lhOff, fetchEnd);
+    const v = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+    if (v.getUint32(0, true) !== 0x04034b50) throw new Error('Local header signature mismatch');
+    const nameLen = v.getUint16(26, true);
+    const extraLen = v.getUint16(28, true);
+    const dataOffset = 30 + nameLen + extraLen;
+
+    let compBytes;
+    if (dataOffset + entry.compSize <= buf.length) {
+      // Speculation succeeded — data already inside fetched buffer
+      compBytes = buf.subarray(dataOffset, dataOffset + entry.compSize);
+    } else {
+      // Rare fallback: name+extra exceeded our guess
+      const dataStart = entry.lhOff + dataOffset;
+      const dataEnd = dataStart + entry.compSize - 1;
+      compBytes = await fetchRange(this.fileId, dataStart, dataEnd);
+    }
 
     if (entry.method === 0) return compBytes;
     if (entry.method === 8) {
       const stream = new Blob([compBytes]).stream()
         .pipeThrough(new DecompressionStream('deflate-raw'));
-      const buf = await new Response(stream).arrayBuffer();
-      return new Uint8Array(buf);
+      const decompBuf = await new Response(stream).arrayBuffer();
+      return new Uint8Array(decompBuf);
     }
     throw new Error('Unsupported compression method: ' + entry.method);
   }
@@ -873,10 +918,12 @@ function setBreadcrumb(text, isSearch) {
 
 async function loadCurrentFolder() {
   state.searching = false;
+  state.history = false;
   state.searchQuery = '';
   $('breadcrumb').classList.remove('hidden');
   $('search-box').classList.add('hidden');
   $('search-btn').classList.remove('active');
+  $('history-btn').classList.remove('active');
 
   const stack = state.folderStack;
   const breadcrumbHtml = stack
@@ -969,6 +1016,10 @@ function goBack() {
     loadCurrentFolder();
     return;
   }
+  if (state.history) {
+    loadCurrentFolder();
+    return;
+  }
   if (state.folderStack.length > 1) {
     state.folderStack.pop();
     loadCurrentFolder();
@@ -978,6 +1029,8 @@ function goBack() {
 }
 
 function enterSearchMode() {
+  state.history = false;
+  $('history-btn').classList.remove('active');
   $('breadcrumb').classList.add('hidden');
   $('search-box').classList.remove('hidden');
   $('search-btn').classList.add('active');
@@ -989,6 +1042,73 @@ function enterSearchMode() {
 function exitSearchMode() {
   $('search-input').value = '';
   loadCurrentFolder();
+}
+
+function enterHistoryMode() {
+  state.searching = false;
+  state.searchQuery = '';
+  state.history = true;
+  $('search-box').classList.add('hidden');
+  $('search-btn').classList.remove('active');
+  $('breadcrumb').classList.remove('hidden');
+  $('history-btn').classList.add('active');
+  $('breadcrumb').innerHTML =
+    '<span class="path">履歴</span><span class="sync-dot" id="sync-dot"></span>';
+  renderHistory();
+}
+
+function exitHistoryMode() {
+  loadCurrentFolder();
+}
+
+function getHistoryEntries() {
+  return Object.entries(state.progress.files)
+    .filter(([_, e]) => e && e.name)               // need at least a name to show
+    .map(([id, e]) => ({ id, ...e }))
+    .sort((a, b) => (b.updated || 0) - (a.updated || 0));
+}
+
+function renderHistory() {
+  const list = $('file-list');
+  const entries = getHistoryEntries();
+  if (!entries.length) {
+    list.innerHTML = '<div class="empty-state">読書履歴はまだありません</div>';
+    return;
+  }
+  const zipIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M12 11v6M9 14h6"/></svg>`;
+
+  list.innerHTML = entries.map((e, i) => {
+    const total = e.totalPages;
+    const pageStr = total
+      ? `P.${e.page + 1} / ${total}`
+      : `P.${e.page + 1}`;
+    const pct = (total && total > 0) ? Math.round(((e.page + 1) / total) * 100) : null;
+    const pctStr = pct != null ? ` (${pct}%)` : '';
+    const timeStr = relTime(e.updated || 0);
+    return `
+      <div class="file-row zip" data-i="${i}">
+        <div class="icon">${zipIcon}</div>
+        <div class="meta">
+          <div class="name">${escapeHtml(e.name)}</div>
+          <div class="sub">
+            <span class="progress-tag">${escapeHtml(pageStr)}${pctStr}</span>
+            <span>${escapeHtml(timeStr)}</span>
+          </div>
+        </div>
+      </div>`;
+  }).join('');
+
+  list.querySelectorAll('.file-row').forEach(row => {
+    row.addEventListener('click', () => {
+      const e = entries[Number(row.dataset.i)];
+      openZip({
+        id: e.id,
+        name: e.name,
+        size: e.size,
+        mimeType: 'application/zip',
+      });
+    });
+  });
 }
 
 //===========================================================================
@@ -1003,7 +1123,7 @@ class Reader {
     this.currentSlotIndex = 0;
     this.viewMode = localStorage.getItem(STORAGE_VIEW_MODE) || 'single';
     this.bitmapCache = new Map();    // pageIndex -> blobUrl
-    this.cacheLimit = 16;
+    this.cacheLimit = 40;            // generous; manga pages ~200-500KB ≈ 8-20MB
     this.loading = new Map();
     this._scrollHandler = null;
   }
@@ -1035,6 +1155,13 @@ class Reader {
       const savedPage = getProgress(this.file.id);
       const startPage = (savedPage != null && savedPage < this.imageEntries.length) ? savedPage : 0;
       this.currentSlotIndex = this.findSlotForPage(startPage);
+
+      // Record metadata so the file shows up in history with name/size/total
+      setProgress(this.file.id, startPage, {
+        name: this.file.name,
+        size: this.file.size,
+        totalPages: this.imageEntries.length,
+      });
 
       this.renderSlots();
       requestAnimationFrame(() => {
@@ -1142,13 +1269,22 @@ class Reader {
   }
 
   preload() {
-    const around = [
-      this.currentSlotIndex,
-      this.currentSlotIndex + 1, this.currentSlotIndex - 1,
-      this.currentSlotIndex + 2, this.currentSlotIndex - 2,
-    ].filter(i => i >= 0 && i < this.slots.length);
+    // Asymmetric: forward-heavy because reading mostly moves forward.
+    // Order matters — Set preserves insertion order, so loadPage is called
+    // in priority order (current → ahead → behind).
+    const FORWARD = 8;
+    const BACKWARD = 2;
+    const slotIndices = [this.currentSlotIndex];
+    for (let i = 1; i <= FORWARD; i++) {
+      const k = this.currentSlotIndex + i;
+      if (k < this.slots.length) slotIndices.push(k);
+    }
+    for (let i = 1; i <= BACKWARD; i++) {
+      const k = this.currentSlotIndex - i;
+      if (k >= 0) slotIndices.push(k);
+    }
     const pages = new Set();
-    for (const sIdx of around) {
+    for (const sIdx of slotIndices) {
       for (const p of this.slots[sIdx]) pages.add(p);
     }
     for (const p of pages) this.loadPage(p);
@@ -1255,7 +1391,8 @@ async function closeReader() {
     state.reader = null;
   }
   await flushProgressSave().catch(() => {});
-  if (state.searching) renderFileList(state.searchResults);
+  if (state.history) renderHistory();
+  else if (state.searching) renderFileList(state.searchResults);
   else renderFileList(state.currentFiles);
   showScreen('browser-screen');
 }
@@ -1290,6 +1427,11 @@ function wireSignIn() {
 function wireBrowser() {
   $('back-btn').addEventListener('click', goBack);
   $('signout-btn').addEventListener('click', signOut);
+
+  $('history-btn').addEventListener('click', () => {
+    if (state.history) exitHistoryMode();
+    else enterHistoryMode();
+  });
 
   $('search-btn').addEventListener('click', () => {
     if (!$('search-box').classList.contains('hidden')) {
