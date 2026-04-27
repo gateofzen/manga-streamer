@@ -203,6 +203,11 @@
     display: flex; align-items: center; justify-content: center;
     overflow: hidden;
   }
+  /* Spread mode: push images toward the spine so they touch in the center.
+     The slot uses row-reverse, so :first-child (DOM-first) is on the RIGHT
+     visually and needs flex-start to hug its left (spine) edge. */
+  .page-slot.spread .page-cell:first-child { justify-content: flex-start; }
+  .page-slot.spread .page-cell:last-child  { justify-content: flex-end; }
   .page-cell img {
     max-width: 100%; max-height: 100%;
     object-fit: contain;
@@ -330,6 +335,7 @@
     </button>
     <div class="title" id="reader-title">—</div>
     <button class="icon-btn" id="view-mode-btn" title="Toggle view mode"></button>
+    <button class="icon-btn" id="fullscreen-btn" title="Fullscreen"></button>
     <div class="page-counter" id="page-counter">0 / 0</div>
   </div>
   <div id="reader-zones">
@@ -375,6 +381,11 @@ const state = {
 const VIEW_MODE_ICONS = {
   single: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="3" width="12" height="18" rx="1"/></svg>`,
   spread: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="8" height="18" rx="1"/><rect x="13" y="3" width="8" height="18" rx="1"/></svg>`,
+};
+
+const FULLSCREEN_ICONS = {
+  enter: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3M21 8V5a2 2 0 0 0-2-2h-3M3 16v3a2 2 0 0 0 2 2h3M16 21h3a2 2 0 0 0 2-2v-3"/></svg>`,
+  exit:  `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3v3a2 2 0 0 1-2 2H3M21 8h-3a2 2 0 0 1-2-2V3M3 16h3a2 2 0 0 1 2 2v3M16 21v-3a2 2 0 0 1 2-2h3"/></svg>`,
 };
 
 //===========================================================================
@@ -423,6 +434,37 @@ function relTime(ts) {
   if (diff < 7 * day) return Math.floor(diff / day) + '日前';
   return new Date(ts).toLocaleDateString('ja-JP');
 }
+
+//---------------------------------------------------------------------------
+// Fullscreen (with Safari/webkit prefix fallback)
+//---------------------------------------------------------------------------
+function isFullscreen() {
+  return !!(document.fullscreenElement || document.webkitFullscreenElement);
+}
+
+function toggleFullscreen() {
+  if (isFullscreen()) {
+    const exitFn = document.exitFullscreen || document.webkitExitFullscreen;
+    if (exitFn) exitFn.call(document);
+  } else {
+    const el = document.documentElement;
+    const reqFn = el.requestFullscreen || el.webkitRequestFullscreen;
+    if (!reqFn) { toast('Fullscreen not supported'); return; }
+    const r = reqFn.call(el);
+    if (r && r.catch) r.catch(e => toast('Fullscreen failed: ' + e.message));
+  }
+}
+
+function updateFullscreenIcon() {
+  const btn = $('fullscreen-btn');
+  if (!btn) return;
+  const fs = isFullscreen();
+  btn.innerHTML = fs ? FULLSCREEN_ICONS.exit : FULLSCREEN_ICONS.enter;
+  btn.title = fs ? 'Exit fullscreen' : 'Fullscreen';
+}
+
+document.addEventListener('fullscreenchange', updateFullscreenIcon);
+document.addEventListener('webkitfullscreenchange', updateFullscreenIcon);
 
 //===========================================================================
 // OAuth (Google Identity Services)
@@ -1206,7 +1248,8 @@ class Reader {
           <div class="placeholder"><div class="spinner small"></div></div>
         </div>
       `).join('');
-      return `<div class="page-slot" data-slot="${slotIdx}">${cells}</div>`;
+      const slotClass = pageIndices.length > 1 ? 'page-slot spread' : 'page-slot';
+      return `<div class="${slotClass}" data-slot="${slotIdx}">${cells}</div>`;
     }).join('');
 
     if (this._scrollHandler) container.removeEventListener('scroll', this._scrollHandler);
@@ -1390,6 +1433,10 @@ async function closeReader() {
     state.reader.destroy();
     state.reader = null;
   }
+  if (isFullscreen()) {
+    const exitFn = document.exitFullscreen || document.webkitExitFullscreen;
+    if (exitFn) exitFn.call(document);
+  }
   await flushProgressSave().catch(() => {});
   if (state.history) renderHistory();
   else if (state.searching) renderFileList(state.searchResults);
@@ -1466,6 +1513,8 @@ function wireReader() {
   $('view-mode-btn').addEventListener('click', () => {
     if (state.reader) state.reader.toggleViewMode();
   });
+  $('fullscreen-btn').addEventListener('click', toggleFullscreen);
+  updateFullscreenIcon();
 
   document.querySelectorAll('#reader-zones > div').forEach(zone => {
     zone.addEventListener('click', () => {
@@ -1479,10 +1528,15 @@ function wireReader() {
 
   document.addEventListener('keydown', (e) => {
     if ($('reader-screen').classList.contains('hidden')) return;
-    if (e.key === 'Escape') closeReader();
+    if (e.key === 'Escape') {
+      // If browser is exiting fullscreen on Esc, don't also close the reader
+      if (isFullscreen()) return;
+      closeReader();
+    }
     else if (e.key === 'ArrowLeft') state.reader && state.reader.next();   // RTL
     else if (e.key === 'ArrowRight') state.reader && state.reader.prev();
     else if (e.key === 'v' || e.key === 'V') state.reader && state.reader.toggleViewMode();
+    else if (e.key === 'f' || e.key === 'F') toggleFullscreen();
   });
 }
 
