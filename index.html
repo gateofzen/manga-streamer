@@ -151,11 +151,45 @@
   .file-row .icon svg { width: 22px; height: 22px; }
   .file-row.folder .icon svg { color: #ffc864; }
   .file-row.zip .icon svg { color: var(--accent); }
+
+  /* Larger thumbnail rows for ZIP files: ~120px tall cover image on the left,
+     metadata on the right. Folders keep the compact small-icon layout. */
+  .file-row.zip {
+    align-items: stretch;
+    padding: 10px 16px;
+    gap: 14px;
+  }
+  .file-row.zip .thumb {
+    flex-shrink: 0;
+    width: 90px;
+    height: 130px;
+    background: var(--surface-2);
+    border-radius: 6px;
+    overflow: hidden;
+    display: flex; align-items: center; justify-content: center;
+    position: relative;
+  }
+  .file-row.zip .thumb img {
+    width: 100%; height: 100%;
+    object-fit: cover;
+    display: block;
+  }
+  .file-row.zip .thumb .thumb-fallback {
+    color: var(--accent); opacity: 0.4;
+  }
+  .file-row.zip .thumb .thumb-fallback svg { width: 32px; height: 32px; }
+  .file-row.zip .meta {
+    display: flex; flex-direction: column; justify-content: center;
+  }
+  /* Hide the small icon column for ZIPs since the thumbnail replaces it */
+  .file-row.zip > .icon { display: none; }
+
   .file-row .meta { flex: 1; min-width: 0; }
   .file-row .name {
     font-size: 14px; overflow: hidden; text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .file-row.zip .name { font-size: 15px; }
   .file-row .sub {
     font-size: 11px; color: var(--text-dim); margin-top: 2px;
     display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
@@ -185,7 +219,9 @@
     overscroll-behavior: contain;
   }
   #reader-pages {
-    flex: 1; display: flex; flex-direction: row-reverse;
+    flex: 1; display: flex; /* LTR: slot N+1 is to the RIGHT of slot N,
+                               so native swipe-left advances (RTL reading
+                               direction is enforced inside each spread slot). */
     overflow-x: auto; overflow-y: hidden;
     scroll-snap-type: x mandatory;
     scrollbar-width: none;
@@ -240,12 +276,10 @@
     white-space: nowrap;
   }
 
-  #reader-zones {
-    position: absolute; inset: 0;
-    display: grid; grid-template-columns: 1fr 1fr 1fr;
-    z-index: 1; pointer-events: none;
-  }
-  #reader-zones > div { pointer-events: auto; }
+  /* Overlay buttons are interactive; empty overlay space passes clicks
+     through so taps in that strip still flip pages or toggle the overlay. */
+  #reader-overlay { pointer-events: none; }
+  #reader-overlay > * { pointer-events: auto; }
 
   /* Toast */
   #toast {
@@ -266,17 +300,25 @@
   <h1>Manga<span class="accent">.</span>Streamer</h1>
   <p class="tagline">Stream ZIP/CBZ manga from Google Drive</p>
 
-  <div class="card">
-    <label for="client-id">Google OAuth Client ID</label>
-    <input id="client-id" type="text" placeholder="xxxxxxxx-xxxx.apps.googleusercontent.com" autocomplete="off" spellcheck="false">
-    <button id="signin-btn" class="btn-primary" disabled>Sign in with Google</button>
-    <div class="help">
-      <strong>Setup (first time only)</strong><br>
-      1. Google Cloud Console で <code>Drive API</code> を有効化<br>
-      2. Google Auth Platform で External + Test users を設定<br>
-      3. Data Access に <code>drive.readonly</code> と <code>drive.appdata</code> を追加<br>
-      4. Web Application Client ID を作成、authorized origins にこのページの origin を登録<br>
-      5. Client ID をここに貼り付け（localStorage に保存）
+  <div class="card" id="signin-card">
+    <div id="auto-signin-status" class="hidden" style="text-align:center;padding:20px 0;color:var(--text-dim);font-size:13px">
+      <div class="spinner small" style="margin:0 auto 10px"></div>
+      Signing in…
+    </div>
+    <div id="signin-form">
+      <label for="client-id">Google OAuth Client ID</label>
+      <input id="client-id" type="text" placeholder="xxxxxxxx-xxxx.apps.googleusercontent.com" autocomplete="off" spellcheck="false">
+      <button id="signin-btn" class="btn-primary" disabled>Sign in with Google</button>
+      <div class="help">
+        <strong>Setup (first time only)</strong><br>
+        1. Google Cloud Console で <code>Drive API</code> を有効化<br>
+        2. Google Auth Platform で External + Test users を設定<br>
+        3. Data Access に <code>drive.readonly</code> と <code>drive.appdata</code> を追加<br>
+        4. Web Application Client ID を作成、authorized origins にこのページの origin を登録<br>
+        5. Client ID をここに貼り付け（localStorage に保存）<br>
+        <br>
+        <strong>Tip:</strong> 共有用に <code>?clientId=...</code> をURLに付けて開くと自動保存されます
+      </div>
     </div>
   </div>
 </div>
@@ -337,11 +379,6 @@
     <button class="icon-btn" id="view-mode-btn" title="Toggle view mode"></button>
     <button class="icon-btn" id="fullscreen-btn" title="Fullscreen"></button>
     <div class="page-counter" id="page-counter">0 / 0</div>
-  </div>
-  <div id="reader-zones">
-    <div id="zone-right" data-action="prev"></div>
-    <div id="zone-mid" data-action="toggle"></div>
-    <div id="zone-left" data-action="next"></div>
   </div>
   <div id="reader-pages"></div>
 </div>
@@ -510,9 +547,11 @@ async function onSignedIn() {
 
 function signOut() {
   flushProgressSave();
-  if (state.accessToken) {
-    google.accounts.oauth2.revoke(state.accessToken, () => {});
-  }
+  // Note: we don't call google.accounts.oauth2.revoke() here. Revoking would
+  // reset the user's consent on Google's side, forcing the consent screen on
+  // next sign-in. Since the user can fully revoke from their Google account
+  // settings anyway, just clearing local tokens is friendlier for the
+  // "sign out and back in" flow.
   state.accessToken = null;
   state.tokenExpiresAt = 0;
   state.progress = { version: 1, files: {} };
@@ -942,6 +981,134 @@ class ZipReader {
 }
 
 //===========================================================================
+// Thumbnail cache (IndexedDB) + on-demand fetcher
+//===========================================================================
+const THUMB_DB_NAME = 'mangaStreamer.thumbs';
+const THUMB_STORE = 'covers';
+let thumbDbPromise = null;
+
+function openThumbDb() {
+  if (thumbDbPromise) return thumbDbPromise;
+  thumbDbPromise = new Promise((resolve, reject) => {
+    const req = indexedDB.open(THUMB_DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      req.result.createObjectStore(THUMB_STORE);
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+  return thumbDbPromise;
+}
+
+async function getCachedThumb(fileId) {
+  try {
+    const db = await openThumbDb();
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(THUMB_STORE, 'readonly');
+      const req = tx.objectStore(THUMB_STORE).get(fileId);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+  } catch { return null; }
+}
+
+async function putCachedThumb(fileId, blob) {
+  try {
+    const db = await openThumbDb();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(THUMB_STORE, 'readwrite');
+      tx.objectStore(THUMB_STORE).put(blob, fileId);
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch {}
+}
+
+// Fetch only the cover (first image entry) of a ZIP without reading the
+// whole archive. Reuses the same EOCD + central-directory streaming logic.
+async function fetchCoverBytes(fileId, fileSize) {
+  if (!fileSize) {
+    fileSize = await getFileSize(fileId);
+  }
+  const zr = new ZipReader(fileId, fileSize);
+  await zr.open();
+  const cover = zr.entries
+    .filter(e => IMAGE_EXT.test(e.name))
+    .sort((a, b) => naturalCompare(a.name, b.name))[0];
+  if (!cover) throw new Error('No cover image in archive');
+  const bytes = await zr.readEntry(cover);
+  const ext = cover.name.split('.').pop().toLowerCase();
+  const mime = ext === 'png' ? 'image/png'
+             : ext === 'webp' ? 'image/webp'
+             : ext === 'gif' ? 'image/gif'
+             : ext === 'avif' ? 'image/avif'
+             : 'image/jpeg';
+  return new Blob([bytes], { type: mime });
+}
+
+// Concurrency-limited thumbnail loader. Called once per visible row when it
+// enters the viewport. Stores blob URLs in a Map for cleanup on re-render.
+const thumbBlobUrls = new Map(); // fileId -> objectURL
+const thumbInflight = new Map(); // fileId -> Promise
+let thumbActiveCount = 0;
+const THUMB_MAX_CONCURRENT = 3;
+const thumbWaitQueue = [];
+
+function thumbAcquireSlot() {
+  return new Promise(resolve => {
+    if (thumbActiveCount < THUMB_MAX_CONCURRENT) {
+      thumbActiveCount++;
+      resolve();
+    } else {
+      thumbWaitQueue.push(resolve);
+    }
+  });
+}
+function thumbReleaseSlot() {
+  thumbActiveCount--;
+  const next = thumbWaitQueue.shift();
+  if (next) { thumbActiveCount++; next(); }
+}
+
+async function loadThumbnail(file, imgEl) {
+  if (thumbInflight.has(file.id)) return thumbInflight.get(file.id);
+
+  const p = (async () => {
+    // Try cache first
+    let blob = await getCachedThumb(file.id);
+    if (!blob) {
+      await thumbAcquireSlot();
+      try {
+        blob = await fetchCoverBytes(file.id, parseInt(file.size, 10));
+        putCachedThumb(file.id, blob);  // fire-and-forget
+      } catch (e) {
+        console.warn('Thumb fetch failed for', file.name, e);
+        return null;
+      } finally {
+        thumbReleaseSlot();
+      }
+    }
+    const url = URL.createObjectURL(blob);
+    thumbBlobUrls.set(file.id, url);
+    if (imgEl && imgEl.isConnected) {
+      imgEl.src = url;
+      imgEl.style.opacity = '0';
+      imgEl.onload = () => { imgEl.style.opacity = '1'; };
+    }
+    return url;
+  })();
+
+  thumbInflight.set(file.id, p);
+  try { return await p; }
+  finally { thumbInflight.delete(file.id); }
+}
+
+function clearThumbBlobUrls() {
+  for (const url of thumbBlobUrls.values()) URL.revokeObjectURL(url);
+  thumbBlobUrls.clear();
+}
+
+//===========================================================================
 // File browser
 //===========================================================================
 const ZIP_EXT = /\.(zip|cbz)$/i;
@@ -1020,6 +1187,8 @@ function renderFileList(files) {
   const folderIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>`;
   const zipIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M12 11v6M9 14h6"/></svg>`;
 
+  clearThumbBlobUrls();
+
   list.innerHTML = files.map((f, i) => {
     const folder = isFolder(f);
     const sizeStr = folder ? 'Folder' : fmtBytes(f.size);
@@ -1030,9 +1199,13 @@ function renderFileList(files) {
         progressTag = `<span class="progress-tag">P.${page + 1}</span>`;
       }
     }
+    const visual = folder
+      ? `<div class="icon">${folderIcon}</div>`
+      : `<div class="icon">${zipIcon}</div>
+         <div class="thumb"><span class="thumb-fallback">${zipIcon}</span><img alt="" loading="lazy" style="display:none;transition:opacity .2s"></div>`;
     return `
       <div class="file-row ${folder ? 'folder' : 'zip'}" data-i="${i}">
-        <div class="icon">${folder ? folderIcon : zipIcon}</div>
+        ${visual}
         <div class="meta">
           <div class="name">${escapeHtml(f.name)}</div>
           <div class="sub"><span>${escapeHtml(sizeStr)}</span>${progressTag}</div>
@@ -1051,6 +1224,43 @@ function renderFileList(files) {
       }
     });
   });
+
+  // Lazy-load thumbnails via IntersectionObserver. Only ZIP rows have
+  // .thumb img elements; observer triggers fetch when row scrolls into view.
+  if ('IntersectionObserver' in window) {
+    const obs = new IntersectionObserver((entries, observer) => {
+      for (const e of entries) {
+        if (!e.isIntersecting) continue;
+        const row = e.target;
+        const idx = Number(row.dataset.i);
+        const file = files[idx];
+        if (!file || isFolder(file)) { observer.unobserve(row); continue; }
+        const img = row.querySelector('.thumb img');
+        const fallback = row.querySelector('.thumb-fallback');
+        if (img) {
+          img.style.display = 'block';
+          loadThumbnail(file, img).then(url => {
+            if (url && fallback) fallback.style.display = 'none';
+          });
+        }
+        observer.unobserve(row);
+      }
+    }, { rootMargin: '300px 0px' });
+    list.querySelectorAll('.file-row.zip').forEach(row => obs.observe(row));
+  } else {
+    // Fallback: load all thumbs immediately (older browsers)
+    list.querySelectorAll('.file-row.zip').forEach(row => {
+      const file = files[Number(row.dataset.i)];
+      const img = row.querySelector('.thumb img');
+      const fallback = row.querySelector('.thumb-fallback');
+      if (img) {
+        img.style.display = 'block';
+        loadThumbnail(file, img).then(url => {
+          if (url && fallback) fallback.style.display = 'none';
+        });
+      }
+    });
+  }
 }
 
 function goBack() {
@@ -1119,6 +1329,8 @@ function renderHistory() {
   }
   const zipIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M12 11v6M9 14h6"/></svg>`;
 
+  clearThumbBlobUrls();
+
   list.innerHTML = entries.map((e, i) => {
     const total = e.totalPages;
     const pageStr = total
@@ -1130,6 +1342,7 @@ function renderHistory() {
     return `
       <div class="file-row zip" data-i="${i}">
         <div class="icon">${zipIcon}</div>
+        <div class="thumb"><span class="thumb-fallback">${zipIcon}</span><img alt="" loading="lazy" style="display:none;transition:opacity .2s"></div>
         <div class="meta">
           <div class="name">${escapeHtml(e.name)}</div>
           <div class="sub">
@@ -1151,6 +1364,28 @@ function renderHistory() {
       });
     });
   });
+
+  // Lazy thumbnails for history
+  if ('IntersectionObserver' in window) {
+    const obs = new IntersectionObserver((items, observer) => {
+      for (const it of items) {
+        if (!it.isIntersecting) continue;
+        const row = it.target;
+        const idx = Number(row.dataset.i);
+        const entry = entries[idx];
+        if (!entry) { observer.unobserve(row); continue; }
+        const img = row.querySelector('.thumb img');
+        const fallback = row.querySelector('.thumb-fallback');
+        if (img) {
+          img.style.display = 'block';
+          loadThumbnail({ id: entry.id, size: entry.size, name: entry.name }, img)
+            .then(url => { if (url && fallback) fallback.style.display = 'none'; });
+        }
+        observer.unobserve(row);
+      }
+    }, { rootMargin: '300px 0px' });
+    list.querySelectorAll('.file-row').forEach(row => obs.observe(row));
+  }
 }
 
 //===========================================================================
@@ -1450,6 +1685,18 @@ async function closeReader() {
 function wireSignIn() {
   const input = $('client-id');
   const btn = $('signin-btn');
+
+  // Allow Client ID via query string for first-time setup or sharing a link:
+  // ?clientId=xxx.apps.googleusercontent.com
+  const params = new URLSearchParams(location.search);
+  const fromQuery = params.get('clientId');
+  if (fromQuery && fromQuery.includes('.apps.googleusercontent.com')) {
+    localStorage.setItem(STORAGE_CLIENT_ID, fromQuery.trim());
+    // Strip the param from the URL so it doesn't linger in history
+    const cleanUrl = location.pathname + location.hash;
+    history.replaceState(null, '', cleanUrl);
+  }
+
   const saved = localStorage.getItem(STORAGE_CLIENT_ID);
   if (saved) input.value = saved;
 
@@ -1463,12 +1710,65 @@ function wireSignIn() {
     const v = input.value.trim();
     state.clientId = v;
     localStorage.setItem(STORAGE_CLIENT_ID, v);
-    if (!initTokenClient()) {
-      toast('Google library still loading — try again in a moment');
+    requestSignIn(true);  // explicit user action → fall back to consent prompt
+  });
+
+  // Auto sign-in: if a Client ID is saved, skip the manual button entirely.
+  // Tries a silent token request first (no UI if user already consented),
+  // falls back to showing the input only on failure.
+  if (saved) {
+    state.clientId = saved;
+    autoSignIn();
+  }
+}
+
+function showAutoSignInState(on) {
+  $('signin-form').classList.toggle('hidden', on);
+  $('auto-signin-status').classList.toggle('hidden', !on);
+}
+
+function requestSignIn(allowConsentPrompt) {
+  if (!initTokenClient()) {
+    const start = Date.now();
+    const wait = setInterval(() => {
+      if (initTokenClient()) {
+        clearInterval(wait);
+        state.tokenClient.requestAccessToken({ prompt: allowConsentPrompt ? 'consent' : '' });
+      } else if (Date.now() - start > 5000) {
+        clearInterval(wait);
+        toast('Could not load Google Sign-In — check your network');
+      }
+    }, 100);
+    return;
+  }
+  state.tokenClient.requestAccessToken({ prompt: allowConsentPrompt ? 'consent' : '' });
+}
+
+async function autoSignIn() {
+  showAutoSignInState(true);
+  // Wait for GIS to finish loading (script is async/defer).
+  if (!initTokenClient()) {
+    const start = Date.now();
+    while (!initTokenClient()) {
+      if (Date.now() - start > 5000) {
+        showAutoSignInState(false);
+        return;
+      }
+      await new Promise(r => setTimeout(r, 100));
+    }
+  }
+  // Override callback so a silent failure does not toast — that's expected.
+  const origCb = state.tokenClient.callback;
+  state.tokenClient.callback = (resp) => {
+    if (resp.error) {
+      // Silent attempt failed. Restore default callback and show the form.
+      state.tokenClient.callback = origCb;
+      showAutoSignInState(false);
       return;
     }
-    state.tokenClient.requestAccessToken({ prompt: 'consent' });
-  });
+    origCb(resp);
+  };
+  state.tokenClient.requestAccessToken({ prompt: '' });
 }
 
 function wireBrowser() {
@@ -1516,14 +1816,16 @@ function wireReader() {
   $('fullscreen-btn').addEventListener('click', toggleFullscreen);
   updateFullscreenIcon();
 
-  document.querySelectorAll('#reader-zones > div').forEach(zone => {
-    zone.addEventListener('click', () => {
-      if (!state.reader) return;
-      const action = zone.dataset.action;
-      if (action === 'next') state.reader.next();
-      else if (action === 'prev') state.reader.prev();
-      else $('reader-overlay').classList.toggle('hidden-overlay');
-    });
+  // Tap zones: use the coordinate of the click on #reader-pages itself, so
+  // we don't need overlay elements that block native swipe-to-scroll.
+  // Left third → next (RTL advance), middle → toggle overlay, right third → prev.
+  $('reader-pages').addEventListener('click', (e) => {
+    if (!state.reader) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const xRatio = (e.clientX - rect.left) / rect.width;
+    if (xRatio < 1/3)       state.reader.next();
+    else if (xRatio > 2/3)  state.reader.prev();
+    else                    $('reader-overlay').classList.toggle('hidden-overlay');
   });
 
   document.addEventListener('keydown', (e) => {
