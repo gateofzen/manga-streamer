@@ -360,6 +360,7 @@
         <polyline points="12 7 12 12 15 14"/>
       </svg>
     </button>
+    <button class="icon-btn" id="sort-btn" title="Sort"></button>
     <button class="icon-btn" id="search-btn" title="Search">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="11" cy="11" r="8"/><path d="M21 21l-4.3-4.3"/>
@@ -410,7 +411,26 @@ const STORAGE_CLIENT_ID = 'mangaStreamer.clientId';
 const STORAGE_PROGRESS_MIRROR = 'mangaStreamer.progressMirror';
 const STORAGE_LEGACY_PROGRESS = 'mangaStreamer.progress';
 const STORAGE_VIEW_MODE = 'mangaStreamer.viewMode';
+const STORAGE_SORT_MODE = 'mangaStreamer.sortMode';
 const PROGRESS_FILENAME = 'progress.json';
+
+const SORT_MODES = ['name_asc', 'name_desc', 'modified_desc', 'modified_asc'];
+const SORT_LABELS = {
+  name_asc:      '名前 A→Z',
+  name_desc:     '名前 Z→A',
+  modified_desc: '更新日 新→旧',
+  modified_asc:  '更新日 旧→新',
+};
+const SORT_ICONS = {
+  // Name A→Z: text lines with down arrow
+  name_asc: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h11M4 12h8M4 18h5"/><path d="M19 4v16M16 17l3 3 3-3"/></svg>`,
+  // Name Z→A: text lines with up arrow
+  name_desc: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h5M4 12h8M4 18h11"/><path d="M19 20V4M16 7l3-3 3 3"/></svg>`,
+  // Modified newest first: clock with down arrow
+  modified_desc: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="12" r="7"/><polyline points="9 8 9 12 12 13"/><path d="M19 6v14M16 17l3 3 3-3"/></svg>`,
+  // Modified oldest first: clock with up arrow
+  modified_asc: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="12" r="7"/><polyline points="9 8 9 12 12 13"/><path d="M19 20V6M16 9l3-3 3 3"/></svg>`,
+};
 
 const state = {
   clientId: null,
@@ -475,6 +495,45 @@ function escapeHtml(s) {
 function showSync(on) {
   const el = $('sync-dot');
   if (el) el.classList.toggle('active', !!on);
+}
+
+function getSortMode() {
+  const v = localStorage.getItem(STORAGE_SORT_MODE);
+  return SORT_MODES.includes(v) ? v : 'name_asc';
+}
+
+function setSortMode(mode) {
+  localStorage.setItem(STORAGE_SORT_MODE, mode);
+  updateSortButton();
+}
+
+function cycleSortMode() {
+  const cur = getSortMode();
+  const next = SORT_MODES[(SORT_MODES.indexOf(cur) + 1) % SORT_MODES.length];
+  setSortMode(next);
+  return next;
+}
+
+function updateSortButton() {
+  const btn = $('sort-btn');
+  if (!btn) return;
+  const mode = getSortMode();
+  btn.innerHTML = SORT_ICONS[mode];
+  btn.title = SORT_LABELS[mode];
+}
+
+// Comparator for the current sort mode. Folders are not affected — they
+// always come first via the main sort wrapper. This applies to ZIP files
+// (and shared folders relative to other shared folders, etc).
+function makeSortComparator() {
+  const mode = getSortMode();
+  switch (mode) {
+    case 'name_asc':       return (a, b) => naturalCompare(a.name, b.name);
+    case 'name_desc':      return (a, b) => naturalCompare(b.name, a.name);
+    case 'modified_desc':  return (a, b) => (b.modifiedTime || '').localeCompare(a.modifiedTime || '');
+    case 'modified_asc':   return (a, b) => (a.modifiedTime || '').localeCompare(b.modifiedTime || '');
+    default:               return (a, b) => naturalCompare(a.name, b.name);
+  }
 }
 
 function relTime(ts) {
@@ -1211,6 +1270,7 @@ async function loadCurrentFolder() {
   $('search-box').classList.add('hidden');
   $('search-btn').classList.remove('active');
   $('history-btn').classList.remove('active');
+  $('sort-btn').classList.remove('hidden');
 
   const stack = state.folderStack;
   const breadcrumbHtml = stack
@@ -1242,12 +1302,13 @@ async function loadCurrentFolder() {
     }
 
     const filtered = all.filter(f => isFolder(f) || isZip(f));
+    const cmp = makeSortComparator();
     filtered.sort((a, b) => {
       // Shared folders first, then own folders, then ZIP files.
       const aShared = !!a._shared, bShared = !!b._shared;
       if (aShared !== bShared) return aShared ? -1 : 1;
       if (isFolder(a) !== isFolder(b)) return isFolder(a) ? -1 : 1;
-      return naturalCompare(a.name, b.name);
+      return cmp(a, b);
     });
     state.currentFiles = filtered;
     renderFileList(filtered);
@@ -1263,10 +1324,12 @@ async function runSearch(query) {
   try {
     const all = await searchDrive(query);
     const filtered = all.filter(f => isFolder(f) || isZip(f));
-    // ZIPs first (more useful for the reader), then folders
+    const cmp = makeSortComparator();
     filtered.sort((a, b) => {
+      // ZIPs first (the more useful target in search), then folders.
+      // Within each group, apply the user's chosen sort.
       if (isFolder(a) !== isFolder(b)) return isFolder(a) ? 1 : -1;
-      return 0;
+      return cmp(a, b);
     });
     state.searchResults = filtered;
     renderFileList(filtered);
@@ -1418,6 +1481,7 @@ function enterHistoryMode() {
   $('search-btn').classList.remove('active');
   $('breadcrumb').classList.remove('hidden');
   $('history-btn').classList.add('active');
+  $('sort-btn').classList.add('hidden');  // history view has its own ordering (most recent first)
   $('breadcrumb').innerHTML =
     '<span class="path">履歴</span><span class="sync-dot" id="sync-dot"></span>';
   renderHistory();
@@ -1961,6 +2025,32 @@ async function autoSignIn() {
 function wireBrowser() {
   $('back-btn').addEventListener('click', navBack);
   $('signout-btn').addEventListener('click', signOut);
+  updateSortButton();
+
+  $('sort-btn').addEventListener('click', () => {
+    const next = cycleSortMode();
+    toast(SORT_LABELS[next], 1200);
+    // Re-sort whichever list is currently shown without re-fetching from Drive
+    const cmp = makeSortComparator();
+    if (state.history) {
+      // History uses its own sort (always by recency), so just re-render
+      renderHistory();
+    } else if (state.searching) {
+      state.searchResults.sort((a, b) => {
+        if (isFolder(a) !== isFolder(b)) return isFolder(a) ? 1 : -1;
+        return cmp(a, b);
+      });
+      renderFileList(state.searchResults);
+    } else {
+      state.currentFiles.sort((a, b) => {
+        const aShared = !!a._shared, bShared = !!b._shared;
+        if (aShared !== bShared) return aShared ? -1 : 1;
+        if (isFolder(a) !== isFolder(b)) return isFolder(a) ? -1 : 1;
+        return cmp(a, b);
+      });
+      renderFileList(state.currentFiles);
+    }
+  });
 
   $('history-btn').addEventListener('click', () => {
     if (state.history) navBack();
