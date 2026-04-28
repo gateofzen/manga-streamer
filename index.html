@@ -1628,10 +1628,7 @@ class Reader {
       });
       if (bestI !== this.currentSlotIndex) {
         this.currentSlotIndex = bestI;
-        this.updateCounter();
-        this.preload();
-        const firstPage = this.slots[bestI][0];
-        setProgress(this.file.id, firstPage);
+        this._settleSlot();
       }
     };
     container.addEventListener('scroll', this._scrollHandler, { passive: true });
@@ -1666,6 +1663,7 @@ class Reader {
     if (this.currentSlotIndex < this.slots.length - 1) {
       this.currentSlotIndex++;
       this.scrollToSlot(this.currentSlotIndex);
+      this._settleSlot();
     }
   }
 
@@ -1673,7 +1671,19 @@ class Reader {
     if (this.currentSlotIndex > 0) {
       this.currentSlotIndex--;
       this.scrollToSlot(this.currentSlotIndex);
+      this._settleSlot();
     }
+  }
+
+  // Run after currentSlotIndex changes from any path (keyboard, tap, swipe,
+  // view mode/pair offset toggle). Centralizes the work so preload + progress
+  // save can't be forgotten by one of the call sites.
+  _settleSlot() {
+    if (this.cancelled) return;
+    this.updateCounter();
+    this.preload();
+    const slot = this.slots[this.currentSlotIndex];
+    if (slot) setProgress(this.file.id, slot[0]);
   }
 
   preload() {
