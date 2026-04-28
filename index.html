@@ -263,6 +263,43 @@
     display: flex; flex-direction: column; align-items: center; gap: 10px;
   }
 
+  /* Next-volume sentinel slot at the end of each book */
+  .page-slot.next-slot { background: #050505; }
+  .next-volume-card {
+    display: flex; flex-direction: column; align-items: center; gap: 16px;
+    padding: 20px; max-width: 360px; text-align: center;
+  }
+  .next-volume-thumb {
+    width: 200px; height: 280px;
+    background: var(--surface-2);
+    border-radius: 8px;
+    overflow: hidden;
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+    position: relative;
+  }
+  .next-volume-thumb img {
+    width: 100%; height: 100%;
+    object-fit: cover;
+    display: block;
+  }
+  .next-volume-thumb .thumb-fallback {
+    color: var(--accent); opacity: 0.4;
+  }
+  .next-volume-thumb .thumb-fallback svg { width: 56px; height: 56px; }
+  .next-volume-label {
+    color: var(--accent); font-size: 13px; font-weight: 600;
+    letter-spacing: 0.1em; text-transform: uppercase;
+    margin-top: 4px;
+  }
+  .next-volume-name {
+    color: var(--text); font-size: 16px; font-weight: 500;
+    line-height: 1.4; word-break: break-all;
+  }
+  .next-volume-hint {
+    color: var(--text-dim); font-size: 12px; margin-top: 4px;
+  }
+
   #reader-overlay {
     position: absolute; left: 0; right: 0; top: 0;
     padding: 6px 12px 10px;
@@ -1246,8 +1283,96 @@ function clearThumbBlobUrls() {
 }
 
 //===========================================================================
-// File browser
+// Series detection — find the "next volume" anywhere in Drive
 //===========================================================================
+// Recognizes common manga volume markers and extracts (seriesName, volumeNum)
+// from a filename. Volume markers are tried roughly in specificity order so
+// "第01巻" wins over a stray trailing number that might be part of the title.
+
+const VOLUME_PATTERNS = [
+  // 第NN巻 / 第NN話 (Japanese)
+  { re: /^(.+?)[\s_\-―〜]*第\s*(\d+)\s*[巻話]/i,            kind: 'jp_dai' },
+  // NN巻 (Japanese, no 第)
+  { re: /^(.+?)[\s_\-―〜]+(\d+)\s*巻/i,                      kind: 'jp_kan' },
+  // (NN) or [NN]
+  { re: /^(.+?)[\s_\-―〜]*[\(\[]\s*(\d+)\s*[\)\]]/,           kind: 'paren' },
+  // vol. NN / v.NN / vNN / Vol NN  (English)
+  { re: /^(.+?)[\s_\-―〜]+v(?:ol)?\.?\s*(\d+)/i,              kind: 'vol' },
+  // # NN
+  { re: /^(.+?)[\s_\-―〜]*#\s*(\d+)/,                          kind: 'hash' },
+  // Trailing number (after separator): "Title 05", "Title_05", "Title-05"
+  // Number must be 1-3 digits to avoid years etc.
+  { re: /^(.+?)[\s_\-]+(\d{1,3})\s*$/,                         kind: 'trailing' },
+];
+
+function parseSeriesAndVolume(filename) {
+  // Strip extension first
+  const base = filename.replace(/\.(zip|cbz)$/i, '').trim();
+  for (const { re, kind } of VOLUME_PATTERNS) {
+    const m = base.match(re);
+    if (m) {
+      const series = m[1]
+        .replace(/[\s_\-―〜]+$/, '')  // trim trailing separators
+        .trim();
+      const volume = parseInt(m[2], 10);
+      if (series.length >= 1 && !isNaN(volume)) {
+        return { series, volume, kind };
+      }
+    }
+  }
+  return null;
+}
+
+// Series-name keyword for Drive search. Drive's `name contains` is fuzzy-ish
+// (token-based) so we feed it the cleanest possible substring of the series
+// name. We pick the longest token (likely the most distinctive one).
+function searchKeywordForSeries(series) {
+  // Try to grab the longest contiguous run of CJK or word characters
+  const tokens = series.match(/[\p{L}\p{N}]+/gu) || [];
+  if (!tokens.length) return series.trim();
+  return tokens.sort((a, b) => b.length - a.length)[0];
+}
+
+async function findNextVolumeInDrive(currentFile) {
+  const parsed = parseSeriesAndVolume(currentFile.name);
+  if (!parsed) return null;
+
+  const keyword = searchKeywordForSeries(parsed.series);
+  if (!keyword || keyword.length < 2) return null;
+
+  // Search Drive for ZIPs whose name contains this keyword
+  let candidates;
+  try {
+    candidates = await searchDrive(keyword);
+  } catch {
+    return null;
+  }
+
+  // Filter to ZIP files only, exclude the current file itself
+  const zips = candidates.filter(f => isZip(f) && f.id !== currentFile.id);
+  if (!zips.length) return null;
+
+  // For each candidate, parse its (series, volume) and require the same series
+  // (loose match: normalized series strings equal). Then pick the closest
+  // higher volume number.
+  const norm = s => s.toLowerCase().replace(/\s+/g, '').replace(/[\u3000\s]/g, '');
+  const targetSeries = norm(parsed.series);
+
+  const matches = [];
+  for (const f of zips) {
+    const p = parseSeriesAndVolume(f.name);
+    if (!p) continue;
+    if (norm(p.series) !== targetSeries) continue;
+    if (p.volume <= parsed.volume) continue;
+    matches.push({ file: f, volume: p.volume });
+  }
+
+  if (!matches.length) return null;
+
+  // Pick the smallest volume number that's greater than current
+  matches.sort((a, b) => a.volume - b.volume);
+  return matches[0].file;
+}
 const ZIP_EXT = /\.(zip|cbz)$/i;
 const IMAGE_EXT = /\.(jpe?g|png|webp|gif|bmp|avif)$/i;
 
@@ -1395,7 +1520,11 @@ function renderFileList(files) {
         state.folderStack.push({ id: f.id, name: f.name });
         loadCurrentFolder();
       } else {
-        openZip(f);
+        // Build series context: ordered list of ZIPs in the current folder
+        // so the reader can offer "next volume" auto-advance.
+        const zips = files.filter(x => isZip(x));
+        const idx = zips.findIndex(x => x.id === f.id);
+        openZip(f, { siblings: zips, index: idx });
       }
     });
   });
@@ -1570,11 +1699,23 @@ function renderHistory() {
 // Reader (with single / spread view modes)
 //===========================================================================
 class Reader {
-  constructor(file) {
+  constructor(file, seriesCtx) {
     this.file = file;
+    // Series context: { siblings: [zip,...], index: N } from the folder
+    // browser. Lets us auto-advance to the next volume when the user
+    // pages past the end. Null when opened from search/history (those
+    // contexts aren't meaningful as a series).
+    this.seriesCtx = seriesCtx || null;
+    // Synchronous: next-in-folder if we have folder context. May be null;
+    // in that case we'll fall back to a Drive-wide series search after open().
+    this.nextFile = (seriesCtx && seriesCtx.siblings && seriesCtx.index >= 0
+                     && seriesCtx.index + 1 < seriesCtx.siblings.length)
+      ? seriesCtx.siblings[seriesCtx.index + 1]
+      : null;
+    this.nextSearchPending = !this.nextFile;  // will trigger Drive-wide search
     this.zip = null;
     this.imageEntries = [];
-    this.slots = [];                 // each is array of page indices
+    this.slots = [];                 // each is array of page indices, OR ['__next__'] sentinel
     this.currentSlotIndex = 0;
     this.viewMode = localStorage.getItem(STORAGE_VIEW_MODE) || 'single';
     this.pairOffset = getPairOffset(file.id); // 0 = cover-alone first, 1 = pair from page 1
@@ -1586,6 +1727,7 @@ class Reader {
                                      // any in-flight loads/handlers that
                                      // would otherwise touch DOM after the
                                      // reader has been replaced
+    this._advanced = false;          // ensures auto-advance fires only once
   }
 
   async start() {
@@ -1630,6 +1772,13 @@ class Reader {
         this.updateCounter();
         this.preload();
       });
+
+      // If we don't already have a next file from folder context, look it up
+      // by parsing the series name and searching Drive globally. This runs
+      // in the background so the reader becomes interactive immediately.
+      if (this.nextSearchPending) {
+        this.searchNextVolume();
+      }
     } catch (e) {
       console.error(e);
       $('reader-pages').innerHTML =
@@ -1637,10 +1786,60 @@ class Reader {
     }
   }
 
+  async searchNextVolume() {
+    try {
+      const found = await findNextVolumeInDrive(this.file);
+      if (this.cancelled || !found) return;
+      this.nextFile = found;
+      // Re-render only the sentinel slot so the new info appears without
+      // disturbing the reading position.
+      this.refreshSentinelSlot();
+    } catch (e) {
+      console.warn('Next-volume search failed:', e);
+    }
+  }
+
+  refreshSentinelSlot() {
+    const container = $('reader-pages');
+    const sentinelIdx = this.slots.findIndex(s => s[0] === '__next__');
+    if (sentinelIdx < 0) return;
+    const slotEl = container.querySelector(`.page-slot[data-slot="${sentinelIdx}"]`);
+    if (!slotEl) return;
+    const next = this.nextFile;
+    const inner = next
+      ? `
+        <div class="next-volume-card">
+          <div class="next-volume-thumb">
+            <div class="thumb-fallback"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg></div>
+            <img alt="" id="next-vol-thumb" style="display:none">
+          </div>
+          <div class="next-volume-label">次の巻</div>
+          <div class="next-volume-name">${escapeHtml(next.name)}</div>
+          <div class="next-volume-hint">もう一度めくると開きます</div>
+        </div>`
+      : `
+        <div class="next-volume-card">
+          <div class="next-volume-label">シリーズ完結</div>
+          <div class="next-volume-name">${escapeHtml(this.file.name)}</div>
+          <div class="next-volume-hint">これが最後の巻です</div>
+        </div>`;
+    slotEl.innerHTML = `<div class="page-cell">${inner}</div>`;
+    if (next) {
+      const img = $('next-vol-thumb');
+      if (img) {
+        loadThumbnail(next, img).then(url => {
+          if (this.cancelled || !url) return;
+          const fallback = container.querySelector('.next-volume-thumb .thumb-fallback');
+          if (fallback) fallback.style.display = 'none';
+        });
+      }
+    }
+  }
+
   buildSlots() {
     const n = this.imageEntries.length;
+    const slots = [];
     if (this.viewMode === 'spread') {
-      const slots = [];
       let start = 0;
       // pairOffset 0: cover stands alone, then pairs start from page index 1
       // pairOffset 1: every page is paired starting from index 0 (no cover-alone)
@@ -1652,15 +1851,22 @@ class Reader {
         if (i + 1 < n) slots.push([i, i + 1]);
         else slots.push([i]);
       }
-      this.slots = slots;
     } else {
-      this.slots = Array.from({ length: n }, (_, i) => [i]);
+      for (let i = 0; i < n; i++) slots.push([i]);
     }
+    // Append a sentinel "next volume" slot at the very end. The user pages
+    // into this and we offer (or auto-advance to) the following file.
+    // Always append even when nextFile is null — in that case it shows
+    // "シリーズ完結" instead.
+    slots.push(['__next__']);
+    this.slots = slots;
   }
 
   findSlotForPage(pageIdx) {
     for (let i = 0; i < this.slots.length; i++) {
-      if (this.slots[i].includes(pageIdx)) return i;
+      const slot = this.slots[i];
+      if (slot[0] === '__next__') continue;  // skip sentinel
+      if (slot.includes(pageIdx)) return i;
     }
     return 0;
   }
@@ -1668,6 +1874,28 @@ class Reader {
   renderSlots() {
     const container = $('reader-pages');
     container.innerHTML = this.slots.map((pageIndices, slotIdx) => {
+      // Sentinel slot for "next volume" prompt at the very end
+      if (pageIndices[0] === '__next__') {
+        const next = this.nextFile;
+        const inner = next
+          ? `
+            <div class="next-volume-card">
+              <div class="next-volume-thumb">
+                <div class="thumb-fallback"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg></div>
+                <img alt="" id="next-vol-thumb" style="display:none">
+              </div>
+              <div class="next-volume-label">次の巻</div>
+              <div class="next-volume-name">${escapeHtml(next.name)}</div>
+              <div class="next-volume-hint">もう一度めくると開きます</div>
+            </div>`
+          : `
+            <div class="next-volume-card">
+              <div class="next-volume-label">シリーズ完結</div>
+              <div class="next-volume-name">${escapeHtml(this.file.name)}</div>
+              <div class="next-volume-hint">これが最後の巻です</div>
+            </div>`;
+        return `<div class="page-slot next-slot" data-slot="${slotIdx}"><div class="page-cell">${inner}</div></div>`;
+      }
       const cells = pageIndices.map(p => `
         <div class="page-cell" data-page="${p}">
           <div class="placeholder"><div class="spinner small"></div></div>
@@ -1676,6 +1904,19 @@ class Reader {
       const slotClass = pageIndices.length > 1 ? 'page-slot spread' : 'page-slot';
       return `<div class="${slotClass}" data-slot="${slotIdx}">${cells}</div>`;
     }).join('');
+
+    // Populate next-volume thumbnail from IndexedDB cache (instant if cached,
+    // otherwise fetch via Drive thumbnailLink)
+    if (this.nextFile) {
+      const img = $('next-vol-thumb');
+      if (img) {
+        loadThumbnail(this.nextFile, img).then(url => {
+          if (this.cancelled || !url) return;
+          const fallback = container.querySelector('.next-volume-thumb .thumb-fallback');
+          if (fallback) fallback.style.display = 'none';
+        });
+      }
+    }
 
     if (this._scrollHandler) container.removeEventListener('scroll', this._scrollHandler);
     this._scrollHandler = () => {
@@ -1706,6 +1947,10 @@ class Reader {
   updateCounter() {
     const slot = this.slots[this.currentSlotIndex] || [0];
     const total = this.imageEntries.length;
+    if (slot[0] === '__next__') {
+      $('page-counter').textContent = this.nextFile ? '次の巻 →' : '完結';
+      return;
+    }
     if (slot.length === 1) {
       $('page-counter').textContent = `${slot[0] + 1} / ${total}`;
     } else {
@@ -1724,6 +1969,14 @@ class Reader {
   }
 
   next() {
+    // If we're already on the next-volume sentinel, the user is trying to
+    // page past it — that's the trigger to auto-advance.
+    const cur = this.slots[this.currentSlotIndex];
+    if (cur && cur[0] === '__next__' && this.nextFile && !this._advanced) {
+      this._advanced = true;
+      this.advanceToNext();
+      return;
+    }
     if (this.currentSlotIndex < this.slots.length - 1) {
       this.currentSlotIndex++;
       this.scrollToSlot(this.currentSlotIndex);
@@ -1739,6 +1992,18 @@ class Reader {
     }
   }
 
+  advanceToNext() {
+    if (!this.nextFile) return;
+    const next = this.nextFile;
+    // Build the next series context: shift index by 1
+    const nextCtx = this.seriesCtx
+      ? { siblings: this.seriesCtx.siblings, index: this.seriesCtx.index + 1 }
+      : null;
+    toast(`次の巻: ${next.name}`, 1500);
+    // openZip handles destroy + new Reader + pushNav
+    openZip(next, nextCtx);
+  }
+
   // Run after currentSlotIndex changes from any path (keyboard, tap, swipe,
   // view mode/pair offset toggle). Centralizes the work so preload + progress
   // save can't be forgotten by one of the call sites.
@@ -1747,7 +2012,10 @@ class Reader {
     this.updateCounter();
     this.preload();
     const slot = this.slots[this.currentSlotIndex];
-    if (slot) setProgress(this.file.id, slot[0]);
+    // Don't save progress on the sentinel slot — its "page" isn't real.
+    // We do treat reaching the last real page as progress, which already
+    // happens on the slot before the sentinel.
+    if (slot && slot[0] !== '__next__') setProgress(this.file.id, slot[0]);
   }
 
   preload() {
@@ -1767,7 +2035,9 @@ class Reader {
     }
     const pages = new Set();
     for (const sIdx of slotIndices) {
-      for (const p of this.slots[sIdx]) pages.add(p);
+      for (const p of this.slots[sIdx]) {
+        if (typeof p === 'number') pages.add(p);  // skip '__next__' sentinel
+      }
     }
     for (const p of pages) this.loadPage(p);
   }
@@ -1901,10 +2171,10 @@ class Reader {
   }
 }
 
-function openZip(file) {
+function openZip(file, seriesCtx) {
   pushNav();
   if (state.reader) state.reader.destroy();
-  state.reader = new Reader(file);
+  state.reader = new Reader(file, seriesCtx);
   state.reader.start();
 }
 
@@ -2101,6 +2371,14 @@ function wireReader() {
   // Left third → next (RTL advance), middle → toggle overlay, right third → prev.
   $('reader-pages').addEventListener('click', (e) => {
     if (!state.reader) return;
+    // On the next-volume sentinel slot, any tap (including the middle area)
+    // advances to the next volume. Otherwise the user would have to find
+    // the left third — confusing on a "press to continue" prompt.
+    const cur = state.reader.slots[state.reader.currentSlotIndex];
+    if (cur && cur[0] === '__next__') {
+      state.reader.next();
+      return;
+    }
     const rect = e.currentTarget.getBoundingClientRect();
     const xRatio = (e.clientX - rect.left) / rect.width;
     if (xRatio < 1/3)       state.reader.next();
