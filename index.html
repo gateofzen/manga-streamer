@@ -2010,16 +2010,27 @@ function wireReader() {
 
   document.addEventListener('keydown', (e) => {
     if ($('reader-screen').classList.contains('hidden')) return;
+    // Don't capture key events from form controls like the search box
+    if (e.target.matches && e.target.matches('input, textarea, select')) return;
+
+    let handled = true;
     if (e.key === 'Escape') {
       // If browser is exiting fullscreen on Esc, don't also close the reader
-      if (isFullscreen()) return;
-      navBack();
+      if (isFullscreen()) { handled = false; }
+      else navBack();
     }
-    else if (e.key === 'ArrowLeft') state.reader && state.reader.next();   // RTL
-    else if (e.key === 'ArrowRight') state.reader && state.reader.prev();
-    else if (e.key === 'v' || e.key === 'V') state.reader && state.reader.toggleViewMode();
-    else if (e.key === 'p' || e.key === 'P') state.reader && state.reader.togglePairOffset();
+    else if (e.key === 'ArrowLeft')  { if (state.reader) state.reader.next(); }   // RTL
+    else if (e.key === 'ArrowRight') { if (state.reader) state.reader.prev(); }
+    else if (e.key === 'v' || e.key === 'V') { if (state.reader) state.reader.toggleViewMode(); }
+    else if (e.key === 'p' || e.key === 'P') { if (state.reader) state.reader.togglePairOffset(); }
     else if (e.key === 'f' || e.key === 'F') toggleFullscreen();
+    else handled = false;
+
+    // Prevent the browser's native scrolling behavior for keys we handle
+    // ourselves. Without this, ArrowLeft/Right would scroll #reader-pages
+    // by ~40px before our scrollIntoView() takes over, briefly revealing
+    // the neighboring slot.
+    if (handled) e.preventDefault();
   });
 }
 
