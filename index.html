@@ -2284,8 +2284,11 @@ class Reader {
   }
 
   preload() {
-    const FORWARD = 8;
-    const BACKWARD = 2;
+    // Tighter window means fewer competing fetches and faster turnaround
+    // for the visible page. We can afford this because the abort logic
+    // means stale fetches release their slot when user scrolls past.
+    const FORWARD = 4;
+    const BACKWARD = 1;
 
     // Build the page list in strict priority order: current slot first
     // (must be visible immediately), then forward (likely next to be seen),
@@ -2329,12 +2332,12 @@ class Reader {
     for (const p of orderedPages) this._enqueueLoad(p);
   }
 
-  // Concurrency-limited load queue. Without this, preload() fires 22 fetches
-  // in parallel and they all compete for bandwidth — the user's visible
-  // page can finish AFTER pages further ahead. Limiting to 4 in-flight
-  // means the current slot's pages (which were enqueued first) finish first.
+  // Concurrency-limited load queue. Without this, preload() fires many
+  // fetches in parallel and they all compete for bandwidth — the user's
+  // visible page can finish AFTER pages further ahead. 6 is a good balance:
+  // enough slots to hold both visible spread pages + immediate look-ahead,
+  // small enough to leave Drive API headroom and keep per-fetch latency low.
   _enqueueLoad(pageIndex) {
-    const MAX_PARALLEL = 4;
     if (!this._loadQueue) this._loadQueue = [];
     if (!this._loadActive) this._loadActive = 0;
     if (this.bitmapCache.has(pageIndex)) {
@@ -2347,7 +2350,7 @@ class Reader {
   }
 
   _pumpQueue() {
-    const MAX_PARALLEL = 4;
+    const MAX_PARALLEL = 6;
     while (this._loadActive < MAX_PARALLEL && this._loadQueue && this._loadQueue.length) {
       const p = this._loadQueue.shift();
       // Skip if already loaded or in flight (queue may have stale entries)
@@ -2474,7 +2477,7 @@ class Reader {
   // Returns a Set of page indices that should NOT be evicted from cache —
   // namely, every page in the current preload window.
   _protectedPages() {
-    const FORWARD = 8, BACKWARD = 2;
+    const FORWARD = 4, BACKWARD = 1;
     const protectedSet = new Set();
     for (let i = -BACKWARD; i <= FORWARD; i++) {
       const k = this.currentSlotIndex + i;
