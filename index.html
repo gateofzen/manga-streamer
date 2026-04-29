@@ -2054,6 +2054,9 @@ class Reader {
   renderSlots() {
     const container = $('reader-pages');
     console.log('[renderSlots] building', this.slots.length, 'slots, current=', this.currentSlotIndex);
+    // Guard against the implicit scroll-to-0 that innerHTML triggers. The
+    // following scrollToSlot() will reset this flag once it's done.
+    this._programmaticScroll = true;
     container.innerHTML = this.slots.map((pageIndices, slotIdx) => {
       // Sentinel slot for "next volume" prompt at the very end
       if (pageIndices[0] === '__next__') {
@@ -2102,6 +2105,10 @@ class Reader {
     if (this._scrollHandler) container.removeEventListener('scroll', this._scrollHandler);
     this._scrollHandler = () => {
       if (this.cancelled) return;
+      // Ignore scroll events fired by our own programmatic scroll, including
+      // the implicit reset to slot 0 that innerHTML replacement causes. Only
+      // user-initiated scrolls should advance currentSlotIndex.
+      if (this._programmaticScroll) return;
       const slots = container.querySelectorAll('.page-slot');
       const cRect = container.getBoundingClientRect();
       const cMid = cRect.left + cRect.width / 2;
@@ -2145,7 +2152,20 @@ class Reader {
     // a transition is genuinely useful.
     const el = $('reader-pages').querySelector(`.page-slot[data-slot="${slotIdx}"]`);
     if (el) {
+      // Suppress scroll handler while we programmatically scroll. Without
+      // this guard, renderSlots() resets DOM scroll to 0 (slot 0), then
+      // scrollIntoView() animates to the target — and the scroll handler
+      // would observe both transitions and update currentSlotIndex on each
+      // intermediate slot it passes through, runaway-incrementing the
+      // current slot far past where the user actually is.
+      this._programmaticScroll = true;
       el.scrollIntoView({ behavior: smooth ? 'smooth' : 'instant', inline: 'start', block: 'nearest' });
+      // Clear the guard after the scroll settles. requestAnimationFrame x2
+      // gives the layout pass + paint pass time to finish before we reopen
+      // user-driven scroll detection.
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        this._programmaticScroll = false;
+      }));
     }
   }
 
