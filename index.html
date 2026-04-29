@@ -1198,11 +1198,11 @@ class ZipReader {
     this.entries = null;
   }
 
-  async open() {
+  async open(signal = null) {
     const tailMax = 65557;
     const tailSize = Math.min(this.fileSize, tailMax);
     const tailStart = this.fileSize - tailSize;
-    const tail = await fetchRange(this.fileId, tailStart, this.fileSize - 1);
+    const tail = await fetchRange(this.fileId, tailStart, this.fileSize - 1, signal);
     const tv = new DataView(tail.buffer, tail.byteOffset, tail.byteLength);
 
     let eocdLocal = -1;
@@ -1219,7 +1219,7 @@ class ZipReader {
       const locLocal = eocdLocal - 20;
       if (locLocal >= 0 && tv.getUint32(locLocal, true) === 0x07064b50) {
         const z64Off = Number(tv.getBigUint64(locLocal + 8, true));
-        const z64Buf = await fetchRange(this.fileId, z64Off, z64Off + 55);
+        const z64Buf = await fetchRange(this.fileId, z64Off, z64Off + 55, signal);
         const z64v = new DataView(z64Buf.buffer, z64Buf.byteOffset, z64Buf.byteLength);
         if (z64v.getUint32(0, true) !== 0x06064b50) throw new Error('ZIP64 EOCD signature mismatch');
         totalEntries = Number(z64v.getBigUint64(32, true));
@@ -1232,7 +1232,7 @@ class ZipReader {
     if (cdOffset >= tailStart) {
       cd = tail.subarray(cdOffset - tailStart, cdOffset - tailStart + cdSize);
     } else {
-      cd = await fetchRange(this.fileId, cdOffset, cdOffset + cdSize - 1);
+      cd = await fetchRange(this.fileId, cdOffset, cdOffset + cdSize - 1, signal);
     }
     const cv = new DataView(cd.buffer, cd.byteOffset, cd.byteLength);
 
@@ -1385,17 +1385,19 @@ async function putCachedThumb(fileId, blob) {
 
 // Fetch only the cover (first image entry) of a ZIP without reading the
 // whole archive. Reuses the same EOCD + central-directory streaming logic.
-async function fetchCoverBytes(fileId, fileSize) {
+async function fetchCoverBytes(fileId, fileSize, signal = null) {
   if (!fileSize) {
     fileSize = await getFileSize(fileId);
   }
+  if (signal && signal.aborted) throw new DOMException('Aborted', 'AbortError');
   const zr = new ZipReader(fileId, fileSize);
-  await zr.open();
+  await zr.open(signal);
+  if (signal && signal.aborted) throw new DOMException('Aborted', 'AbortError');
   const cover = zr.entries
     .filter(e => IMAGE_EXT.test(e.name))
     .sort((a, b) => naturalCompare(a.name, b.name))[0];
   if (!cover) throw new Error('No cover image in archive');
-  const bytes = await zr.readEntry(cover);
+  const bytes = await zr.readEntry(cover, signal);
   const ext = cover.name.split('.').pop().toLowerCase();
   const mime = ext === 'png' ? 'image/png'
              : ext === 'webp' ? 'image/webp'
@@ -1429,7 +1431,20 @@ function thumbReleaseSlot() {
   if (next) { thumbActiveCount++; next(); }
 }
 
-async function fetchThumbViaLink(file) {
+// Track in-flight thumbnail abort controllers so we can cancel them when
+// the user enters the Reader. Without this, a screen of thumbnail fetches
+// keeps occupying the global Drive concurrency gate, starving the page
+// fetches the user is now actively waiting for.
+const _thumbAbortControllers = new Map(); // fileId -> AbortController
+
+function cancelAllThumbnailLoads() {
+  for (const [id, ctl] of _thumbAbortControllers) {
+    ctl.abort();
+  }
+  _thumbAbortControllers.clear();
+}
+
+async function fetchThumbViaLink(file, signal = null) {
   // Drive's thumbnailLink ends with ...=s220 by default. Bumping it to a
   // higher value gives a sharper image at our 90x130 display size on retina.
   // (=sNNN sets the longest-edge pixel size; 400 is a good sweet spot.)
@@ -1438,7 +1453,7 @@ async function fetchThumbViaLink(file) {
   url = url.replace(/=s\d+(?:-[a-z]+)?$/i, '=s400');
   // thumbnailLink requires authentication via header — passing the access
   // token as ?access_token= in the URL also works but Authorization is cleaner.
-  const resp = await driveFetch(url);
+  const resp = await driveFetch(url, { signal });
   if (!resp.ok) {
     if (resp._timeoutCleanup) resp._timeoutCleanup();
     return null;
@@ -1455,18 +1470,26 @@ async function loadThumbnail(file, imgEl) {
   // thumbnail will be picked up when they return to the file list.
   if (state.reader && !state.reader.cancelled) return null;
 
+  const ctl = new AbortController();
+  _thumbAbortControllers.set(file.id, ctl);
+  const signal = ctl.signal;
+  const isAborted = () => signal.aborted;
+
   const p = (async () => {
     // 1. Persistent cache (IndexedDB) — instant if we've seen this file before
     let blob = await getCachedThumb(file.id);
+    if (isAborted()) return null;
 
     // 2. Drive's pre-generated thumbnail — single fast request, image already
     //    sized + optimized by Google's image servers
     if (!blob && file.hasThumbnail !== false && file.thumbnailLink) {
       await thumbAcquireSlot();
+      if (isAborted()) { thumbReleaseSlot(); return null; }
       try {
-        blob = await fetchThumbViaLink(file);
+        blob = await fetchThumbViaLink(file, signal);
         if (blob) putCachedThumb(file.id, blob);
       } catch (e) {
+        if (isAborted()) return null;
         console.warn('thumbnailLink fetch failed for', file.name, e);
       } finally {
         thumbReleaseSlot();
@@ -1476,18 +1499,22 @@ async function loadThumbnail(file, imgEl) {
     // 3. Fallback: parse the ZIP and pull out the cover image ourselves.
     //    Used when thumbnailLink isn't available (very new files, ZIPs Drive
     //    didn't generate a thumb for, etc.)
-    if (!blob) {
+    if (!blob && !isAborted()) {
       await thumbAcquireSlot();
+      if (isAborted()) { thumbReleaseSlot(); return null; }
       try {
-        blob = await fetchCoverBytes(file.id, parseInt(file.size, 10));
+        blob = await fetchCoverBytes(file.id, parseInt(file.size, 10), signal);
         putCachedThumb(file.id, blob);
       } catch (e) {
+        if (isAborted()) return null;
         console.warn('Cover fallback failed for', file.name, e);
         return null;
       } finally {
         thumbReleaseSlot();
       }
     }
+
+    if (isAborted() || !blob) return null;
 
     const url = URL.createObjectURL(blob);
     thumbBlobUrls.set(file.id, url);
@@ -1501,7 +1528,10 @@ async function loadThumbnail(file, imgEl) {
 
   thumbInflight.set(file.id, p);
   try { return await p; }
-  finally { thumbInflight.delete(file.id); }
+  finally {
+    thumbInflight.delete(file.id);
+    _thumbAbortControllers.delete(file.id);
+  }
 }
 
 function clearThumbBlobUrls() {
@@ -1965,6 +1995,19 @@ class Reader {
     const tag = `[Reader.start ${this.file.name}]`;
     console.log(tag, 'BEGIN');
     console.log(tag, 'reader-pages currently has', $('reader-pages').children.length, 'children');
+
+    // Cancel any thumbnail fetches still in flight from the file list. They
+    // were started speculatively while the user browsed; now that the user
+    // has chosen a manga, those thumbnails are no longer urgent and they're
+    // sitting in the global Drive concurrency gate, blocking the page
+    // fetches the user is actively waiting for. Cancelling them frees those
+    // slots immediately. They'll be re-fetched if the user returns to the
+    // file list (and most are cached after the first successful load).
+    const cancelled = _thumbAbortControllers.size;
+    if (cancelled > 0) {
+      console.log(tag, 'cancelling', cancelled, 'in-flight thumbnail loads');
+      cancelAllThumbnailLoads();
+    }
 
     $('reader-title').textContent = this.file.name;
     $('page-counter').textContent = 'Loading…';
