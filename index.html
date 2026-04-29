@@ -1461,14 +1461,16 @@ async function fetchThumbViaLink(file, signal = null) {
   return await readBodyBlob(resp);
 }
 
-async function loadThumbnail(file, imgEl) {
+async function loadThumbnail(file, imgEl, opts = {}) {
   if (thumbInflight.has(file.id)) return thumbInflight.get(file.id);
 
   // While a Reader is open, the user is actively waiting for manga pages.
   // Holding off thumbnail prefetches keeps full bandwidth + Drive API
   // capacity available for the pages they actually want to see. The
   // thumbnail will be picked up when they return to the file list.
-  if (state.reader && !state.reader.cancelled) return null;
+  // Exception: the Reader itself opts in via {force: true} for the
+  // next-volume sentinel thumbnail, which is part of the reading UI.
+  if (state.reader && !state.reader.cancelled && !opts.force) return null;
 
   const ctl = new AbortController();
   _thumbAbortControllers.set(file.id, ctl);
@@ -2116,7 +2118,7 @@ class Reader {
     if (next) {
       const img = $('next-vol-thumb');
       if (img) {
-        loadThumbnail(next, img).then(url => {
+        loadThumbnail(next, img, { force: true }).then(url => {
           if (this.cancelled || !url) return;
           const fallback = container.querySelector('.next-volume-thumb .thumb-fallback');
           if (fallback) fallback.style.display = 'none';
@@ -2199,11 +2201,13 @@ class Reader {
     }).join('');
 
     // Populate next-volume thumbnail from IndexedDB cache (instant if cached,
-    // otherwise fetch via Drive thumbnailLink)
+    // otherwise fetch via Drive thumbnailLink). force: true bypasses the
+    // "pause thumbnails while Reader is open" rule because this thumbnail
+    // is part of the Reader UI itself.
     if (this.nextFile) {
       const img = $('next-vol-thumb');
       if (img) {
-        loadThumbnail(this.nextFile, img).then(url => {
+        loadThumbnail(this.nextFile, img, { force: true }).then(url => {
           if (this.cancelled || !url) return;
           const fallback = container.querySelector('.next-volume-thumb .thumb-fallback');
           if (fallback) fallback.style.display = 'none';
