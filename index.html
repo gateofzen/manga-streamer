@@ -1869,6 +1869,10 @@ class Reader {
   }
 
   async start() {
+    const tag = `[Reader.start ${this.file.name}]`;
+    console.log(tag, 'BEGIN');
+    console.log(tag, 'reader-pages currently has', $('reader-pages').children.length, 'children');
+
     $('reader-title').textContent = this.file.name;
     $('page-counter').textContent = 'Loading…';
     $('reader-pages').innerHTML =
@@ -1878,12 +1882,19 @@ class Reader {
     showScreen('reader-screen');
 
     try {
+      console.log(tag, 'getting file size...');
       const size = parseInt(this.file.size, 10) || await getFileSize(this.file.id);
+      console.log(tag, 'size=', size);
+      if (this.cancelled) { console.log(tag, 'cancelled before zip.open'); return; }
       this.zip = new ZipReader(this.file.id, size);
+      console.log(tag, 'calling zip.open...');
       await this.zip.open();
+      console.log(tag, 'zip.open done, entries:', this.zip.entries.length);
+      if (this.cancelled) { console.log(tag, 'cancelled after zip.open'); return; }
       this.imageEntries = this.zip.entries
         .filter(e => IMAGE_EXT.test(e.name))
         .sort((a, b) => naturalCompare(a.name, b.name));
+      console.log(tag, 'imageEntries:', this.imageEntries.length);
 
       if (!this.imageEntries.length) {
         $('reader-pages').innerHTML =
@@ -1892,6 +1903,7 @@ class Reader {
       }
 
       this.buildSlots();
+      console.log(tag, 'slots built:', this.slots.length);
 
       const savedPage = getProgress(this.file.id);
       const startPage = (savedPage != null && savedPage < this.imageEntries.length) ? savedPage : 0;
@@ -1904,8 +1916,10 @@ class Reader {
         totalPages: this.imageEntries.length,
       });
 
+      console.log(tag, 'calling renderSlots');
       this.renderSlots();
       requestAnimationFrame(() => {
+        if (this.cancelled) return;
         this.scrollToSlot(this.currentSlotIndex, false);
         this.updateCounter();
         this.preload();
@@ -1917,8 +1931,9 @@ class Reader {
       if (this.nextSearchPending) {
         this.searchNextVolume();
       }
+      console.log(tag, 'END');
     } catch (e) {
-      console.error(e);
+      console.error(tag, 'FAILED:', e);
       $('reader-pages').innerHTML =
         `<div class="page-slot"><div class="page-cell"><div class="placeholder">Error: ${escapeHtml(e.message)}</div></div></div>`;
     }
