@@ -901,7 +901,7 @@ async function getFileSize(fileId) {
   return parseInt(data.size, 10);
 }
 
-async function fetchRange(fileId, start, end) {
+async function fetchRange(fileId, start, end, signal = null) {
   const tag = `[fetchRange ${start}-${end}]`;
   const t0 = Date.now();
   console.log(tag, 'enter');
@@ -924,6 +924,7 @@ async function fetchRange(fileId, start, end) {
   const work = (async () => {
     const resp = await driveFetch(url, {
       headers: { 'Range': `bytes=${start}-${end}` },
+      signal,
     });
     if (!resp.ok && resp.status !== 206) {
       if (resp._timeoutCleanup) resp._timeoutCleanup();
@@ -1286,7 +1287,7 @@ class ZipReader {
     return entries;
   }
 
-  async readEntry(entry) {
+  async readEntry(entry, signal = null) {
     if (entry.encrypted) throw new Error('Encrypted ZIP entries are not supported');
 
     // Speculative single-range fetch: assume name+extra ≤ 256 bytes, get
@@ -1294,7 +1295,7 @@ class ZipReader {
     const ASSUMED_NAME_EXTRA = 256;
     const speculativeEnd = entry.lhOff + 30 + ASSUMED_NAME_EXTRA + entry.compSize - 1;
     const fetchEnd = Math.min(speculativeEnd, this.fileSize - 1);
-    const buf = await fetchRange(this.fileId, entry.lhOff, fetchEnd);
+    const buf = await fetchRange(this.fileId, entry.lhOff, fetchEnd, signal);
     const v = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
     if (v.getUint32(0, true) !== 0x04034b50) throw new Error('Local header signature mismatch');
     const nameLen = v.getUint16(26, true);
@@ -1307,7 +1308,7 @@ class ZipReader {
     } else {
       const dataStart = entry.lhOff + dataOffset;
       const dataEnd = dataStart + entry.compSize - 1;
-      compBytes = await fetchRange(this.fileId, dataStart, dataEnd);
+      compBytes = await fetchRange(this.fileId, dataStart, dataEnd, signal);
     }
 
     if (entry.method === 0) return compBytes;
@@ -2307,9 +2308,23 @@ class Reader {
 
     console.log('[preload] ordered pages=', orderedPages);
 
-    // Reset the queue and re-prime it in the new priority order. If the
-    // user scrolled, pages from the previous preload window that are no
-    // longer relevant should yield slots to the new visible page.
+    // CRITICAL: Abort in-flight loads whose pages are no longer in the
+    // preload window. Without this, when the user scrolls fast, the four
+    // parallel slots stay occupied by stale fetches for pages that left
+    // the window — newly-visible pages have to wait, leaving spinners
+    // on screen even though the network is idle.
+    const wantedSet = new Set(orderedPages);
+    if (this._inflightAborts) {
+      for (const [page, ctl] of this._inflightAborts) {
+        if (!wantedSet.has(page)) {
+          console.log(`[preload] aborting stale loadPage ${page}`);
+          ctl.abort();
+          this._inflightAborts.delete(page);
+        }
+      }
+    }
+
+    // Reset the queue and re-prime it in the new priority order.
     if (this._loadQueue) this._loadQueue.length = 0;
     for (const p of orderedPages) this._enqueueLoad(p);
   }
@@ -2363,6 +2378,16 @@ class Reader {
     console.log(`[loadPage ${pageIndex}] starting fetch`);
     const startTime = Date.now();
 
+    // AbortController for this fetch — preload() will call ctl.abort() when
+    // the user scrolls far enough that this page leaves the preload window.
+    // Aborting frees the underlying Drive connection so the new visible
+    // page can take its parallelism slot immediately.
+    const ctl = new AbortController();
+    if (!this._inflightAborts) this._inflightAborts = new Map();
+    this._inflightAborts.set(pageIndex, ctl);
+
+    const isAborted = () => ctl.signal.aborted;
+
     const p = (async () => {
       try {
         const entry = this.imageEntries[pageIndex];
@@ -2370,18 +2395,22 @@ class Reader {
         let bytes;
         try {
           console.log(`[loadPage ${pageIndex}] readEntry attempt 1`);
-          bytes = await this.zip.readEntry(entry);
+          bytes = await this.zip.readEntry(entry, ctl.signal);
           console.log(`[loadPage ${pageIndex}] readEntry success, ${bytes.length} bytes, ${Date.now()-startTime}ms`);
         } catch (err1) {
+          if (isAborted()) {
+            console.log(`[loadPage ${pageIndex}] aborted during attempt 1`);
+            return;
+          }
           console.warn(`[loadPage ${pageIndex}] attempt 1 failed:`, err1.message);
           if (this.cancelled) return;
           await new Promise(r => setTimeout(r, 400));
-          if (this.cancelled) return;
+          if (this.cancelled || isAborted()) return;
           console.log(`[loadPage ${pageIndex}] readEntry attempt 2`);
-          bytes = await this.zip.readEntry(entry);
+          bytes = await this.zip.readEntry(entry, ctl.signal);
           console.log(`[loadPage ${pageIndex}] readEntry retry success`);
         }
-        if (this.cancelled) return;
+        if (this.cancelled || isAborted()) return;
         const ext = entry.name.split('.').pop().toLowerCase();
         const mime = ext === 'png' ? 'image/png'
                    : ext === 'webp' ? 'image/webp'
@@ -2395,6 +2424,13 @@ class Reader {
         this.attachImage(pageIndex, url);
         console.log(`[loadPage ${pageIndex}] DONE (${Date.now()-startTime}ms)`);
       } catch (e) {
+        // Aborted loads should bail silently — they didn't truly fail, the
+        // user just scrolled past. Showing a "load failed" UI for them
+        // would be wrong (and they'll be re-fetched if scrolled back to).
+        if (isAborted()) {
+          console.log(`[loadPage ${pageIndex}] aborted (silent bail)`);
+          return;
+        }
         console.error(`[loadPage ${pageIndex}] FAILED after ${Date.now()-startTime}ms:`, e);
         if (this.cancelled) return;
         const cell = $('reader-pages').querySelector(`.page-cell[data-page="${pageIndex}"]`);
@@ -2417,6 +2453,7 @@ class Reader {
         }
       } finally {
         this.loading.delete(pageIndex);
+        if (this._inflightAborts) this._inflightAborts.delete(pageIndex);
       }
     })();
 
@@ -2527,6 +2564,13 @@ class Reader {
     if (this._scrollHandler) {
       $('reader-pages').removeEventListener('scroll', this._scrollHandler);
       this._scrollHandler = null;
+    }
+    // Abort all in-flight loads so the underlying fetches release their
+    // network/Drive slots immediately. Without this, opening a new file
+    // would still wait for the old file's preload pages to finish.
+    if (this._inflightAborts) {
+      for (const ctl of this._inflightAborts.values()) ctl.abort();
+      this._inflightAborts.clear();
     }
     for (const url of this.bitmapCache.values()) URL.revokeObjectURL(url);
     this.bitmapCache.clear();
