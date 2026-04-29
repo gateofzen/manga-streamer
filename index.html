@@ -633,9 +633,15 @@ function initTokenClient() {
   return true;
 }
 
+// Concurrent-safe token refresh. Multiple parallel fetches that all hit a
+// stale token would otherwise stomp on tokenClient.callback and cause some
+// of them to hang forever. We dedupe to a single in-flight refresh.
+let _tokenRefreshPromise = null;
+
 function ensureToken() {
   if (state.accessToken && Date.now() < state.tokenExpiresAt) return Promise.resolve();
-  return new Promise((resolve, reject) => {
+  if (_tokenRefreshPromise) return _tokenRefreshPromise;
+  _tokenRefreshPromise = new Promise((resolve, reject) => {
     if (!state.tokenClient && !initTokenClient()) {
       reject(new Error('GIS not loaded'));
       return;
@@ -647,7 +653,11 @@ function ensureToken() {
       else resolve();
     };
     state.tokenClient.requestAccessToken({ prompt: '' });
-  });
+    // Hard timeout in case GIS itself stalls (rare but observed on
+    // backgrounded mobile tabs)
+    setTimeout(() => reject(new Error('Token refresh timeout')), 15000);
+  }).finally(() => { _tokenRefreshPromise = null; });
+  return _tokenRefreshPromise;
 }
 
 async function onSignedIn() {
@@ -676,17 +686,53 @@ function signOut() {
 //===========================================================================
 async function driveFetch(url, init = {}) {
   await ensureToken();
+  // Default 20s hard timeout for any single Drive API call. Mobile Safari
+  // (and others) sometimes leave fetches in a never-resolving state when
+  // the tab loses focus or the network flips. Without an AbortController
+  // we'd see the reader stuck on a spinner indefinitely.
+  const timeoutMs = init.timeoutMs || 20000;
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), timeoutMs);
+  // Caller-supplied signal: chain it so external aborts also work
+  const signal = init.signal
+    ? composeAbort(init.signal, ctl.signal)
+    : ctl.signal;
   const headers = Object.assign({}, init.headers, {
     'Authorization': 'Bearer ' + state.accessToken,
   });
-  const resp = await fetch(url, Object.assign({}, init, { headers }));
-  if (resp.status === 401) {
-    state.accessToken = null;
-    await ensureToken();
-    headers.Authorization = 'Bearer ' + state.accessToken;
-    return fetch(url, Object.assign({}, init, { headers }));
+  try {
+    let resp;
+    try {
+      resp = await fetch(url, Object.assign({}, init, { headers, signal }));
+    } catch (err) {
+      // Normalize abort errors to a clearer message for the UI layer
+      if (err && err.name === 'AbortError') throw new Error('Network timeout');
+      throw err;
+    }
+    if (resp.status === 401) {
+      state.accessToken = null;
+      await ensureToken();
+      headers.Authorization = 'Bearer ' + state.accessToken;
+      try {
+        return await fetch(url, Object.assign({}, init, { headers, signal }));
+      } catch (err) {
+        if (err && err.name === 'AbortError') throw new Error('Network timeout');
+        throw err;
+      }
+    }
+    return resp;
+  } finally {
+    clearTimeout(t);
   }
-  return resp;
+}
+
+// Combine an external signal with our local timeout signal so either can abort
+function composeAbort(a, b) {
+  const ctl = new AbortController();
+  const onAbort = () => ctl.abort();
+  if (a.aborted || b.aborted) ctl.abort();
+  else { a.addEventListener('abort', onAbort); b.addEventListener('abort', onAbort); }
+  return ctl.signal;
 }
 
 async function listFolder(folderId) {
