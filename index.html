@@ -638,6 +638,34 @@ function initTokenClient() {
 // of them to hang forever. We dedupe to a single in-flight refresh.
 let _tokenRefreshPromise = null;
 
+// Global gate on Drive API requests. Even with our per-feature limits,
+// when reader page fetches + thumbnail fetches + progress saves all stack
+// up they collectively trigger Drive's per-user rate limiting, after which
+// every fetch starts taking 15-20 seconds. Capping the total in-flight
+// count keeps every individual request snappy. 6 is empirically a good
+// balance: enough parallelism to mask per-request latency, low enough to
+// stay clear of Drive's throttling threshold for steady use.
+const DRIVE_MAX_INFLIGHT = 6;
+let _driveActiveCount = 0;
+const _driveWaitQueue = [];
+
+function _driveAcquire() {
+  return new Promise(resolve => {
+    if (_driveActiveCount < DRIVE_MAX_INFLIGHT) {
+      _driveActiveCount++;
+      resolve();
+    } else {
+      _driveWaitQueue.push(resolve);
+    }
+  });
+}
+
+function _driveRelease() {
+  _driveActiveCount--;
+  const next = _driveWaitQueue.shift();
+  if (next) { _driveActiveCount++; next(); }
+}
+
 function ensureToken() {
   if (state.accessToken && Date.now() < state.tokenExpiresAt) return Promise.resolve();
   if (_tokenRefreshPromise) return _tokenRefreshPromise;
@@ -687,9 +715,22 @@ function signOut() {
 async function driveFetch(url, init = {}) {
   const tag = '[driveFetch ' + Math.random().toString(36).substring(2, 7) + ']';
   console.log(tag, 'enter', url.substring(0, 80));
+  await _driveAcquire();
+  try {
+    return await _driveFetchInner(url, init, tag);
+  } finally {
+    _driveRelease();
+  }
+}
+
+async function _driveFetchInner(url, init, tag) {
   await ensureToken();
   console.log(tag, 'token ready');
-  const timeoutMs = init.timeoutMs || 20000;
+  // Drive sometimes intentionally slow-responds when the user has many
+  // requests in flight. 45s gives genuine slow responses time to land
+  // before we abort. The hard fetchRange-level timeout still catches true
+  // hangs at 60s.
+  const timeoutMs = init.timeoutMs || 45000;
   const ctl = new AbortController();
   const timeoutId = setTimeout(() => {
     console.warn(tag, 'TIMEOUT after', timeoutMs, 'ms — aborting');
@@ -715,13 +756,29 @@ async function driveFetch(url, init = {}) {
     }
   };
 
-  let resp = await doFetch(headers);
-  if (resp.status === 401) {
-    console.log(tag, '401, refreshing token');
-    state.accessToken = null;
-    await ensureToken();
-    headers.Authorization = 'Bearer ' + state.accessToken;
+  // Up to 3 attempts total: handle 401 (refresh token), 429 (rate limit),
+  // and 5xx (transient server errors) with exponential backoff.
+  let resp;
+  let attempt = 0;
+  while (true) {
+    attempt++;
     resp = await doFetch(headers);
+    if (resp.status === 401 && attempt === 1) {
+      console.log(tag, '401, refreshing token');
+      state.accessToken = null;
+      await ensureToken();
+      headers.Authorization = 'Bearer ' + state.accessToken;
+      continue;
+    }
+    if ((resp.status === 429 || (resp.status >= 500 && resp.status < 600)) && attempt < 3) {
+      // Drain body before retrying to free the connection
+      try { await resp.text(); } catch {}
+      const backoff = Math.min(8000, 500 * Math.pow(2, attempt - 1));
+      console.warn(tag, `status ${resp.status}, retrying after ${backoff}ms`);
+      await new Promise(r => setTimeout(r, backoff));
+      continue;
+    }
+    break;
   }
   resp._timeoutCleanup = () => {
     console.log(tag, 'timeout cleanup called');
@@ -851,9 +908,11 @@ async function fetchRange(fileId, start, end) {
   const url = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&supportsAllDrives=true`;
 
   // Hard JavaScript-level timeout that bypasses anything that might be wrong
-  // with AbortController on the user's browser. After 25 seconds we reject
-  // unconditionally, regardless of what fetch() is doing internally.
-  const HARD_TIMEOUT_MS = 25000;
+  // with AbortController on the user's browser. After 60 seconds we reject
+  // unconditionally, regardless of what fetch() is doing internally. This
+  // matches our 45s driveFetch timeout + a 15s body-read margin, plus
+  // extra headroom for retry attempts on 429/5xx.
+  const HARD_TIMEOUT_MS = 60000;
   let hardTimeoutId;
   const hardTimeout = new Promise((_, reject) => {
     hardTimeoutId = setTimeout(() => {
