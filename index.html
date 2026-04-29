@@ -2011,6 +2011,7 @@ class Reader {
 
   renderSlots() {
     const container = $('reader-pages');
+    console.log('[renderSlots] building', this.slots.length, 'slots, current=', this.currentSlotIndex);
     container.innerHTML = this.slots.map((pageIndices, slotIdx) => {
       // Sentinel slot for "next volume" prompt at the very end
       if (pageIndices[0] === '__next__') {
@@ -2147,19 +2148,14 @@ class Reader {
   // save can't be forgotten by one of the call sites.
   _settleSlot() {
     if (this.cancelled) return;
+    console.log('[_settleSlot] currentSlotIndex=', this.currentSlotIndex);
     this.updateCounter();
     this.preload();
     const slot = this.slots[this.currentSlotIndex];
-    // Don't save progress on the sentinel slot — its "page" isn't real.
-    // We do treat reaching the last real page as progress, which already
-    // happens on the slot before the sentinel.
     if (slot && slot[0] !== '__next__') setProgress(this.file.id, slot[0]);
   }
 
   preload() {
-    // Asymmetric: forward-heavy because reading mostly moves forward.
-    // Order matters — Set preserves insertion order, so loadPage is called
-    // in priority order (current → ahead → behind).
     const FORWARD = 8;
     const BACKWARD = 2;
     const slotIndices = [this.currentSlotIndex];
@@ -2174,9 +2170,10 @@ class Reader {
     const pages = new Set();
     for (const sIdx of slotIndices) {
       for (const p of this.slots[sIdx]) {
-        if (typeof p === 'number') pages.add(p);  // skip '__next__' sentinel
+        if (typeof p === 'number') pages.add(p);
       }
     }
+    console.log('[preload] window slots=', slotIndices, 'pages=', [...pages]);
     for (const p of pages) this.loadPage(p);
   }
 
