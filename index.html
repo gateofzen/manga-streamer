@@ -1720,7 +1720,11 @@ class Reader {
     this.viewMode = localStorage.getItem(STORAGE_VIEW_MODE) || 'single';
     this.pairOffset = getPairOffset(file.id); // 0 = cover-alone first, 1 = pair from page 1
     this.bitmapCache = new Map();    // pageIndex -> blobUrl
-    this.cacheLimit = 40;            // generous; manga pages ~200-500KB ≈ 8-20MB
+    // Cache must comfortably exceed the preload window. Forward 8 + backward
+    // 2 = 11 slots; in spread mode each slot holds 2 pages, so the
+    // window can be up to ~22 pages. Anything below that risks evicting a
+    // page we still need, which manifests as "page goes back to spinner".
+    this.cacheLimit = 60;
     this.loading = new Map();
     this._scrollHandler = null;
     this.cancelled = false;          // flipped by destroy() to short-circuit
@@ -2056,7 +2060,17 @@ class Reader {
     const p = (async () => {
       try {
         const entry = this.imageEntries[pageIndex];
-        const bytes = await this.zip.readEntry(entry);
+        // Try once, retry once with a short backoff on transient failures
+        // (network blips most commonly surface as "Failed to fetch").
+        let bytes;
+        try {
+          bytes = await this.zip.readEntry(entry);
+        } catch (err1) {
+          if (this.cancelled) return;
+          await new Promise(r => setTimeout(r, 400));
+          if (this.cancelled) return;
+          bytes = await this.zip.readEntry(entry);  // throws if 2nd attempt also fails
+        }
         // The reader may have been closed/replaced while we were fetching.
         // Drop the result silently — touching DOM here would corrupt the
         // currently-open reader (the new page-cell with the same data-page
@@ -2076,7 +2090,24 @@ class Reader {
       } catch (e) {
         if (this.cancelled) return;
         const cell = $('reader-pages').querySelector(`.page-cell[data-page="${pageIndex}"]`);
-        if (cell) cell.innerHTML = `<div class="placeholder">Error: ${escapeHtml(e.message)}</div>`;
+        if (cell) {
+          // Show error with a "tap to retry" affordance — much better UX
+          // than a permanent error message for transient failures.
+          cell.innerHTML = `
+            <div class="placeholder load-error" style="cursor:pointer">
+              <div style="color:var(--accent);font-size:18px">⟲</div>
+              <div>読み込み失敗</div>
+              <div style="font-size:11px;opacity:0.7">タップで再試行</div>
+            </div>`;
+          const retry = cell.querySelector('.load-error');
+          if (retry) {
+            retry.addEventListener('click', (ev) => {
+              ev.stopPropagation();  // don't trigger page-flip tap zones
+              cell.innerHTML = '<div class="placeholder"><div class="spinner small"></div></div>';
+              this.loadPage(pageIndex);
+            });
+          }
+        }
       } finally {
         this.loading.delete(pageIndex);
       }
@@ -2096,15 +2127,40 @@ class Reader {
     }
   }
 
+  // Returns a Set of page indices that should NOT be evicted from cache —
+  // namely, every page in the current preload window.
+  _protectedPages() {
+    const FORWARD = 8, BACKWARD = 2;
+    const protectedSet = new Set();
+    for (let i = -BACKWARD; i <= FORWARD; i++) {
+      const k = this.currentSlotIndex + i;
+      if (k < 0 || k >= this.slots.length) continue;
+      for (const p of this.slots[k]) {
+        if (typeof p === 'number') protectedSet.add(p);
+      }
+    }
+    return protectedSet;
+  }
+
   evictCache() {
-    while (this.bitmapCache.size > this.cacheLimit) {
-      const oldestKey = this.bitmapCache.keys().next().value;
+    if (this.bitmapCache.size <= this.cacheLimit) return;
+    const protectedSet = this._protectedPages();
+    // Walk the LRU order (Map iteration = insertion order, oldest first)
+    // and evict the first non-protected entries. If everything is protected
+    // we leave the cache slightly oversized rather than evict something we
+    // need — the next preload pass will balance things out.
+    for (const oldestKey of [...this.bitmapCache.keys()]) {
+      if (this.bitmapCache.size <= this.cacheLimit) break;
+      if (protectedSet.has(oldestKey)) continue;
       const url = this.bitmapCache.get(oldestKey);
       URL.revokeObjectURL(url);
       this.bitmapCache.delete(oldestKey);
-      if (this.cancelled) continue;
-      const cell = $('reader-pages').querySelector(`.page-cell[data-page="${oldestKey}"]`);
-      if (cell) cell.innerHTML = '<div class="placeholder"><div class="spinner small"></div></div>';
+      // Don't rewrite the DOM here. The cell for an evicted page is far
+      // off-screen; if the user scrolls back, preload() will re-trigger
+      // loadPage which sets up the spinner placeholder before fetching.
+      // (Previously we forced a spinner here, which sometimes overwrote a
+      // visible image when the cache was tight, creating the "spinner that
+      // never resolves" bug.)
     }
   }
 
