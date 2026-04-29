@@ -690,40 +690,43 @@ async function driveFetch(url, init = {}) {
   // (and others) sometimes leave fetches in a never-resolving state when
   // the tab loses focus or the network flips. Without an AbortController
   // we'd see the reader stuck on a spinner indefinitely.
+  //
+  // CRITICAL: the timeout must cover the entire request including body read.
+  // fetch() resolves as soon as response headers arrive — body streaming
+  // happens after that and CAN HANG INDEPENDENTLY. So we don't clearTimeout
+  // here; we set both the timer and the abort signal on the response so
+  // the caller's body read also gets aborted on timeout.
   const timeoutMs = init.timeoutMs || 20000;
   const ctl = new AbortController();
-  const t = setTimeout(() => ctl.abort(), timeoutMs);
-  // Caller-supplied signal: chain it so external aborts also work
+  const timeoutId = setTimeout(() => ctl.abort(), timeoutMs);
   const signal = init.signal
     ? composeAbort(init.signal, ctl.signal)
     : ctl.signal;
   const headers = Object.assign({}, init.headers, {
     'Authorization': 'Bearer ' + state.accessToken,
   });
-  try {
-    let resp;
+
+  const doFetch = async (hdrs) => {
     try {
-      resp = await fetch(url, Object.assign({}, init, { headers, signal }));
+      return await fetch(url, Object.assign({}, init, { headers: hdrs, signal }));
     } catch (err) {
-      // Normalize abort errors to a clearer message for the UI layer
       if (err && err.name === 'AbortError') throw new Error('Network timeout');
       throw err;
     }
-    if (resp.status === 401) {
-      state.accessToken = null;
-      await ensureToken();
-      headers.Authorization = 'Bearer ' + state.accessToken;
-      try {
-        return await fetch(url, Object.assign({}, init, { headers, signal }));
-      } catch (err) {
-        if (err && err.name === 'AbortError') throw new Error('Network timeout');
-        throw err;
-      }
-    }
-    return resp;
-  } finally {
-    clearTimeout(t);
+  };
+
+  let resp = await doFetch(headers);
+  if (resp.status === 401) {
+    state.accessToken = null;
+    await ensureToken();
+    headers.Authorization = 'Bearer ' + state.accessToken;
+    resp = await doFetch(headers);
   }
+  // Attach our timeout cleanup hook to the response so callers can release
+  // the timer once they've finished reading the body.
+  resp._timeoutCleanup = () => clearTimeout(timeoutId);
+  resp._abortSignal = signal;
+  return resp;
 }
 
 // Combine an external signal with our local timeout signal so either can abort
@@ -733,6 +736,42 @@ function composeAbort(a, b) {
   if (a.aborted || b.aborted) ctl.abort();
   else { a.addEventListener('abort', onAbort); b.addEventListener('abort', onAbort); }
   return ctl.signal;
+}
+
+// Helper: read response body with timeout still active, then cleanup.
+// Use this instead of plain `await resp.arrayBuffer()` after driveFetch.
+async function readBodyArrayBuffer(resp) {
+  try {
+    const ab = await resp.arrayBuffer();
+    return ab;
+  } catch (err) {
+    if (err && err.name === 'AbortError') throw new Error('Network timeout');
+    throw err;
+  } finally {
+    if (resp._timeoutCleanup) resp._timeoutCleanup();
+  }
+}
+
+async function readBodyJson(resp) {
+  try {
+    return await resp.json();
+  } catch (err) {
+    if (err && err.name === 'AbortError') throw new Error('Network timeout');
+    throw err;
+  } finally {
+    if (resp._timeoutCleanup) resp._timeoutCleanup();
+  }
+}
+
+async function readBodyBlob(resp) {
+  try {
+    return await resp.blob();
+  } catch (err) {
+    if (err && err.name === 'AbortError') throw new Error('Network timeout');
+    throw err;
+  } finally {
+    if (resp._timeoutCleanup) resp._timeoutCleanup();
+  }
 }
 
 async function listFolder(folderId) {
@@ -748,7 +787,7 @@ async function listFolder(folderId) {
   });
   const resp = await driveFetch('https://www.googleapis.com/drive/v3/files?' + params);
   if (!resp.ok) throw new Error('Drive list failed: ' + resp.status);
-  const data = await resp.json();
+  const data = await readBodyJson(resp);
   return data.files || [];
 }
 
@@ -771,7 +810,7 @@ async function listSharedFolders() {
     console.warn('Shared folder list failed:', resp.status);
     return [];
   }
-  const data = await resp.json();
+  const data = await readBodyJson(resp);
   return data.files || [];
 }
 
@@ -790,7 +829,7 @@ async function searchDrive(query) {
   });
   const resp = await driveFetch('https://www.googleapis.com/drive/v3/files?' + params);
   if (!resp.ok) throw new Error('Drive search failed: ' + resp.status);
-  const data = await resp.json();
+  const data = await readBodyJson(resp);
   return data.files || [];
 }
 
@@ -799,7 +838,7 @@ async function getFileSize(fileId) {
     `https://www.googleapis.com/drive/v3/files/${fileId}?fields=size,name&supportsAllDrives=true`
   );
   if (!resp.ok) throw new Error('Drive metadata failed: ' + resp.status);
-  const data = await resp.json();
+  const data = await readBodyJson(resp);
   return parseInt(data.size, 10);
 }
 
@@ -811,7 +850,7 @@ async function fetchRange(fileId, start, end) {
   if (!resp.ok && resp.status !== 206) {
     throw new Error('Drive range fetch failed: ' + resp.status);
   }
-  return new Uint8Array(await resp.arrayBuffer());
+  return new Uint8Array(await readBodyArrayBuffer(resp));
 }
 
 //---------------------------------------------------------------------------
@@ -825,7 +864,7 @@ async function findProgressFile() {
   });
   const resp = await driveFetch('https://www.googleapis.com/drive/v3/files?' + params);
   if (!resp.ok) throw new Error('AppData list failed: ' + resp.status);
-  const data = await resp.json();
+  const data = await readBodyJson(resp);
   const f = (data.files || []).find(x => x.name === PROGRESS_FILENAME);
   return f ? f.id : null;
 }
@@ -835,7 +874,7 @@ async function readProgressFile(fileId) {
     `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`
   );
   if (!resp.ok) throw new Error('AppData read failed: ' + resp.status);
-  return await resp.json();
+  return await readBodyJson(resp);
 }
 
 async function createProgressFile(content) {
@@ -858,7 +897,7 @@ async function createProgressFile(content) {
     }
   );
   if (!resp.ok) throw new Error('AppData create failed: ' + resp.status);
-  const data = await resp.json();
+  const data = await readBodyJson(resp);
   return data.id;
 }
 
@@ -871,6 +910,7 @@ async function updateProgressFile(fileId, content) {
       body: JSON.stringify(content),
     }
   );
+  if (resp._timeoutCleanup) resp._timeoutCleanup();
   if (!resp.ok) throw new Error('AppData update failed: ' + resp.status);
 }
 
@@ -1267,8 +1307,11 @@ async function fetchThumbViaLink(file) {
   // thumbnailLink requires authentication via header — passing the access
   // token as ?access_token= in the URL also works but Authorization is cleaner.
   const resp = await driveFetch(url);
-  if (!resp.ok) return null;
-  return await resp.blob();
+  if (!resp.ok) {
+    if (resp._timeoutCleanup) resp._timeoutCleanup();
+    return null;
+  }
+  return await readBodyBlob(resp);
 }
 
 async function loadThumbnail(file, imgEl) {
