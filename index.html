@@ -685,20 +685,16 @@ function signOut() {
 // Drive client
 //===========================================================================
 async function driveFetch(url, init = {}) {
+  const tag = '[driveFetch ' + Math.random().toString(36).substring(2, 7) + ']';
+  console.log(tag, 'enter', url.substring(0, 80));
   await ensureToken();
-  // Default 20s hard timeout for any single Drive API call. Mobile Safari
-  // (and others) sometimes leave fetches in a never-resolving state when
-  // the tab loses focus or the network flips. Without an AbortController
-  // we'd see the reader stuck on a spinner indefinitely.
-  //
-  // CRITICAL: the timeout must cover the entire request including body read.
-  // fetch() resolves as soon as response headers arrive — body streaming
-  // happens after that and CAN HANG INDEPENDENTLY. So we don't clearTimeout
-  // here; we set both the timer and the abort signal on the response so
-  // the caller's body read also gets aborted on timeout.
+  console.log(tag, 'token ready');
   const timeoutMs = init.timeoutMs || 20000;
   const ctl = new AbortController();
-  const timeoutId = setTimeout(() => ctl.abort(), timeoutMs);
+  const timeoutId = setTimeout(() => {
+    console.warn(tag, 'TIMEOUT after', timeoutMs, 'ms — aborting');
+    ctl.abort();
+  }, timeoutMs);
   const signal = init.signal
     ? composeAbort(init.signal, ctl.signal)
     : ctl.signal;
@@ -708,8 +704,12 @@ async function driveFetch(url, init = {}) {
 
   const doFetch = async (hdrs) => {
     try {
-      return await fetch(url, Object.assign({}, init, { headers: hdrs, signal }));
+      console.log(tag, 'fetch starting');
+      const r = await fetch(url, Object.assign({}, init, { headers: hdrs, signal }));
+      console.log(tag, 'fetch resolved, status=', r.status);
+      return r;
     } catch (err) {
+      console.warn(tag, 'fetch threw:', err.name, err.message);
       if (err && err.name === 'AbortError') throw new Error('Network timeout');
       throw err;
     }
@@ -717,14 +717,16 @@ async function driveFetch(url, init = {}) {
 
   let resp = await doFetch(headers);
   if (resp.status === 401) {
+    console.log(tag, '401, refreshing token');
     state.accessToken = null;
     await ensureToken();
     headers.Authorization = 'Bearer ' + state.accessToken;
     resp = await doFetch(headers);
   }
-  // Attach our timeout cleanup hook to the response so callers can release
-  // the timer once they've finished reading the body.
-  resp._timeoutCleanup = () => clearTimeout(timeoutId);
+  resp._timeoutCleanup = () => {
+    console.log(tag, 'timeout cleanup called');
+    clearTimeout(timeoutId);
+  };
   resp._abortSignal = signal;
   return resp;
 }
@@ -843,14 +845,42 @@ async function getFileSize(fileId) {
 }
 
 async function fetchRange(fileId, start, end) {
+  const tag = `[fetchRange ${start}-${end}]`;
+  const t0 = Date.now();
+  console.log(tag, 'enter');
   const url = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&supportsAllDrives=true`;
-  const resp = await driveFetch(url, {
-    headers: { 'Range': `bytes=${start}-${end}` },
+
+  // Hard JavaScript-level timeout that bypasses anything that might be wrong
+  // with AbortController on the user's browser. After 25 seconds we reject
+  // unconditionally, regardless of what fetch() is doing internally.
+  const HARD_TIMEOUT_MS = 25000;
+  let hardTimeoutId;
+  const hardTimeout = new Promise((_, reject) => {
+    hardTimeoutId = setTimeout(() => {
+      console.error(tag, 'HARD TIMEOUT after', HARD_TIMEOUT_MS, 'ms');
+      reject(new Error('fetchRange hard timeout'));
+    }, HARD_TIMEOUT_MS);
   });
-  if (!resp.ok && resp.status !== 206) {
-    throw new Error('Drive range fetch failed: ' + resp.status);
+
+  const work = (async () => {
+    const resp = await driveFetch(url, {
+      headers: { 'Range': `bytes=${start}-${end}` },
+    });
+    if (!resp.ok && resp.status !== 206) {
+      if (resp._timeoutCleanup) resp._timeoutCleanup();
+      throw new Error('Drive range fetch failed: ' + resp.status);
+    }
+    console.log(tag, 'headers ok, reading body...');
+    const ab = await readBodyArrayBuffer(resp);
+    console.log(tag, 'done', Date.now()-t0, 'ms,', ab.byteLength, 'bytes');
+    return new Uint8Array(ab);
+  })();
+
+  try {
+    return await Promise.race([work, hardTimeout]);
+  } finally {
+    clearTimeout(hardTimeoutId);
   }
-  return new Uint8Array(await readBodyArrayBuffer(resp));
 }
 
 //---------------------------------------------------------------------------
@@ -1187,10 +1217,8 @@ class ZipReader {
 
     let compBytes;
     if (dataOffset + entry.compSize <= buf.length) {
-      // Speculation succeeded — data already inside fetched buffer
       compBytes = buf.subarray(dataOffset, dataOffset + entry.compSize);
     } else {
-      // Rare fallback: name+extra exceeded our guess
       const dataStart = entry.lhOff + dataOffset;
       const dataEnd = dataStart + entry.compSize - 1;
       compBytes = await fetchRange(this.fileId, dataStart, dataEnd);
@@ -1198,10 +1226,27 @@ class ZipReader {
 
     if (entry.method === 0) return compBytes;
     if (entry.method === 8) {
-      const stream = new Blob([compBytes]).stream()
-        .pipeThrough(new DecompressionStream('deflate-raw'));
-      const decompBuf = await new Response(stream).arrayBuffer();
-      return new Uint8Array(decompBuf);
+      // Decompression with hard timeout — we have seen DecompressionStream
+      // (or the underlying ReadableStream) hang on certain inputs.
+      const DECOMPRESS_TIMEOUT_MS = 15000;
+      let timeoutId;
+      const timeout = new Promise((_, reject) => {
+        timeoutId = setTimeout(() => {
+          console.error('[decompress] hard timeout for', entry.name);
+          reject(new Error('Decompression timeout'));
+        }, DECOMPRESS_TIMEOUT_MS);
+      });
+      const work = (async () => {
+        const stream = new Blob([compBytes]).stream()
+          .pipeThrough(new DecompressionStream('deflate-raw'));
+        const decompBuf = await new Response(stream).arrayBuffer();
+        return new Uint8Array(decompBuf);
+      })();
+      try {
+        return await Promise.race([work, timeout]);
+      } finally {
+        clearTimeout(timeoutId);
+      }
     }
     throw new Error('Unsupported compression method: ' + entry.method);
   }
@@ -2142,28 +2187,35 @@ class Reader {
       this.bitmapCache.delete(pageIndex);
       this.bitmapCache.set(pageIndex, url);
       this.attachImage(pageIndex, url);
+      console.log(`[loadPage ${pageIndex}] cache hit`);
       return;
     }
-    if (this.loading.has(pageIndex)) return this.loading.get(pageIndex);
+    if (this.loading.has(pageIndex)) {
+      console.log(`[loadPage ${pageIndex}] already loading, returning existing promise`);
+      return this.loading.get(pageIndex);
+    }
+
+    console.log(`[loadPage ${pageIndex}] starting fetch`);
+    const startTime = Date.now();
 
     const p = (async () => {
       try {
         const entry = this.imageEntries[pageIndex];
-        // Try once, retry once with a short backoff on transient failures
-        // (network blips most commonly surface as "Failed to fetch").
+        console.log(`[loadPage ${pageIndex}] entry:`, entry.name, 'compSize:', entry.compSize);
         let bytes;
         try {
+          console.log(`[loadPage ${pageIndex}] readEntry attempt 1`);
           bytes = await this.zip.readEntry(entry);
+          console.log(`[loadPage ${pageIndex}] readEntry success, ${bytes.length} bytes, ${Date.now()-startTime}ms`);
         } catch (err1) {
+          console.warn(`[loadPage ${pageIndex}] attempt 1 failed:`, err1.message);
           if (this.cancelled) return;
           await new Promise(r => setTimeout(r, 400));
           if (this.cancelled) return;
-          bytes = await this.zip.readEntry(entry);  // throws if 2nd attempt also fails
+          console.log(`[loadPage ${pageIndex}] readEntry attempt 2`);
+          bytes = await this.zip.readEntry(entry);
+          console.log(`[loadPage ${pageIndex}] readEntry retry success`);
         }
-        // The reader may have been closed/replaced while we were fetching.
-        // Drop the result silently — touching DOM here would corrupt the
-        // currently-open reader (the new page-cell with the same data-page
-        // index belongs to a different file).
         if (this.cancelled) return;
         const ext = entry.name.split('.').pop().toLowerCase();
         const mime = ext === 'png' ? 'image/png'
@@ -2176,22 +2228,23 @@ class Reader {
         this.bitmapCache.set(pageIndex, url);
         this.evictCache();
         this.attachImage(pageIndex, url);
+        console.log(`[loadPage ${pageIndex}] DONE (${Date.now()-startTime}ms)`);
       } catch (e) {
+        console.error(`[loadPage ${pageIndex}] FAILED after ${Date.now()-startTime}ms:`, e);
         if (this.cancelled) return;
         const cell = $('reader-pages').querySelector(`.page-cell[data-page="${pageIndex}"]`);
         if (cell) {
-          // Show error with a "tap to retry" affordance — much better UX
-          // than a permanent error message for transient failures.
           cell.innerHTML = `
             <div class="placeholder load-error" style="cursor:pointer">
               <div style="color:var(--accent);font-size:18px">⟲</div>
               <div>読み込み失敗</div>
+              <div style="font-size:11px;opacity:0.7">${escapeHtml(e.message || 'Unknown error')}</div>
               <div style="font-size:11px;opacity:0.7">タップで再試行</div>
             </div>`;
           const retry = cell.querySelector('.load-error');
           if (retry) {
             retry.addEventListener('click', (ev) => {
-              ev.stopPropagation();  // don't trigger page-flip tap zones
+              ev.stopPropagation();
               cell.innerHTML = '<div class="placeholder"><div class="spinner small"></div></div>';
               this.loadPage(pageIndex);
             });
