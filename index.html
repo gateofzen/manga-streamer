@@ -1389,6 +1389,12 @@ async function fetchThumbViaLink(file) {
 async function loadThumbnail(file, imgEl) {
   if (thumbInflight.has(file.id)) return thumbInflight.get(file.id);
 
+  // While a Reader is open, the user is actively waiting for manga pages.
+  // Holding off thumbnail prefetches keeps full bandwidth + Drive API
+  // capacity available for the pages they actually want to see. The
+  // thumbnail will be picked up when they return to the file list.
+  if (state.reader && !state.reader.cancelled) return null;
+
   const p = (async () => {
     // 1. Persistent cache (IndexedDB) — instant if we've seen this file before
     let blob = await getCachedThumb(file.id);
@@ -2236,7 +2242,43 @@ class Reader {
       }
     }
     console.log('[preload] window slots=', slotIndices, 'pages=', [...pages]);
-    for (const p of pages) this.loadPage(p);
+    // Kick off in priority order. The current slot's pages come first in the
+    // Set's insertion order, so they enter the load queue first. With a
+    // concurrency limit (see _enqueueLoad), this means the user's visible
+    // page is fetched ahead of look-ahead pages competing for the same
+    // bandwidth.
+    for (const p of pages) this._enqueueLoad(p);
+  }
+
+  // Concurrency-limited load queue. Without this, preload() fires 22 fetches
+  // in parallel and they all compete for bandwidth — the user's visible
+  // page can finish AFTER pages further ahead. Limiting to 4 in-flight
+  // means the current slot's pages (which were enqueued first) finish first.
+  _enqueueLoad(pageIndex) {
+    const MAX_PARALLEL = 4;
+    if (!this._loadQueue) this._loadQueue = [];
+    if (!this._loadActive) this._loadActive = 0;
+    if (this.bitmapCache.has(pageIndex)) {
+      this.loadPage(pageIndex);  // cache hit path is synchronous-ish
+      return;
+    }
+    if (this.loading.has(pageIndex)) return;  // already in flight, no need to queue
+    this._loadQueue.push(pageIndex);
+    this._pumpQueue();
+  }
+
+  _pumpQueue() {
+    const MAX_PARALLEL = 4;
+    while (this._loadActive < MAX_PARALLEL && this._loadQueue && this._loadQueue.length) {
+      const p = this._loadQueue.shift();
+      // Skip if already loaded or in flight (queue may have stale entries)
+      if (this.bitmapCache.has(p) || this.loading.has(p)) continue;
+      this._loadActive++;
+      this.loadPage(p).finally(() => {
+        this._loadActive--;
+        if (!this.cancelled) this._pumpQueue();
+      });
+    }
   }
 
   async loadPage(pageIndex) {
@@ -2425,6 +2467,7 @@ class Reader {
     for (const url of this.bitmapCache.values()) URL.revokeObjectURL(url);
     this.bitmapCache.clear();
     this.loading.clear();
+    if (this._loadQueue) this._loadQueue.length = 0;
   }
 }
 
