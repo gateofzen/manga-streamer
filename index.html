@@ -2285,28 +2285,33 @@ class Reader {
   preload() {
     const FORWARD = 8;
     const BACKWARD = 2;
-    const slotIndices = [this.currentSlotIndex];
-    for (let i = 1; i <= FORWARD; i++) {
-      const k = this.currentSlotIndex + i;
-      if (k < this.slots.length) slotIndices.push(k);
-    }
-    for (let i = 1; i <= BACKWARD; i++) {
-      const k = this.currentSlotIndex - i;
-      if (k >= 0) slotIndices.push(k);
-    }
-    const pages = new Set();
-    for (const sIdx of slotIndices) {
-      for (const p of this.slots[sIdx]) {
-        if (typeof p === 'number') pages.add(p);
+
+    // Build the page list in strict priority order: current slot first
+    // (must be visible immediately), then forward (likely next to be seen),
+    // then backward (only if user scrolls back). Earlier entries get
+    // priority access to the limited concurrent fetch slots.
+    const orderedPages = [];
+    const seen = new Set();
+    const addSlot = (k) => {
+      if (k < 0 || k >= this.slots.length) return;
+      for (const p of this.slots[k]) {
+        if (typeof p === 'number' && !seen.has(p)) {
+          seen.add(p);
+          orderedPages.push(p);
+        }
       }
-    }
-    console.log('[preload] window slots=', slotIndices, 'pages=', [...pages]);
-    // Kick off in priority order. The current slot's pages come first in the
-    // Set's insertion order, so they enter the load queue first. With a
-    // concurrency limit (see _enqueueLoad), this means the user's visible
-    // page is fetched ahead of look-ahead pages competing for the same
-    // bandwidth.
-    for (const p of pages) this._enqueueLoad(p);
+    };
+    addSlot(this.currentSlotIndex);                     // visible — top priority
+    for (let i = 1; i <= FORWARD; i++) addSlot(this.currentSlotIndex + i);
+    for (let i = 1; i <= BACKWARD; i++) addSlot(this.currentSlotIndex - i);
+
+    console.log('[preload] ordered pages=', orderedPages);
+
+    // Reset the queue and re-prime it in the new priority order. If the
+    // user scrolled, pages from the previous preload window that are no
+    // longer relevant should yield slots to the new visible page.
+    if (this._loadQueue) this._loadQueue.length = 0;
+    for (const p of orderedPages) this._enqueueLoad(p);
   }
 
   // Concurrency-limited load queue. Without this, preload() fires 22 fetches
