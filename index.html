@@ -932,16 +932,43 @@ async function createProgressFile(content) {
 }
 
 async function updateProgressFile(fileId, content) {
-  const resp = await driveFetch(
-    `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`,
-    {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json; charset=UTF-8' },
-      body: JSON.stringify(content),
+  console.log('[updateProgressFile] PATCH starting');
+  const HARD_TIMEOUT_MS = 15000;
+  let hardTimeoutId;
+  const hardTimeout = new Promise((_, reject) => {
+    hardTimeoutId = setTimeout(() => {
+      console.error('[updateProgressFile] HARD TIMEOUT');
+      reject(new Error('updateProgressFile hard timeout'));
+    }, HARD_TIMEOUT_MS);
+  });
+  const work = (async () => {
+    const resp = await driveFetch(
+      `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`,
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json; charset=UTF-8' },
+        body: JSON.stringify(content),
+      }
+    );
+    console.log('[updateProgressFile] response received, status=', resp.status);
+    // PATCH returns a JSON body — must drain it for the timeout to clear.
+    // Previously we just looked at resp.status and called _timeoutCleanup
+    // without reading the body, which on some browsers leaves the connection
+    // (and the TCP read pump) hanging until the timeout fires anyway.
+    try {
+      await readBodyJson(resp);
+    } catch (e) {
+      // Even if JSON parse fails, the body is now consumed.
+      console.warn('[updateProgressFile] body parse failed (non-fatal):', e.message);
     }
-  );
-  if (resp._timeoutCleanup) resp._timeoutCleanup();
-  if (!resp.ok) throw new Error('AppData update failed: ' + resp.status);
+    if (!resp.ok) throw new Error('AppData update failed: ' + resp.status);
+    console.log('[updateProgressFile] DONE');
+  })();
+  try {
+    await Promise.race([work, hardTimeout]);
+  } finally {
+    clearTimeout(hardTimeoutId);
+  }
 }
 
 //===========================================================================
