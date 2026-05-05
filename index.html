@@ -258,6 +258,37 @@
     object-fit: contain;
     user-select: none; -webkit-user-drag: none;
   }
+  /* Split mode: show only half of the source image. We need predictable
+     positioning so override the cell's flex centering — set position:
+     relative on the cell, absolute on the img, then anchor the img to
+     the side that shows the half we want. The image is sized to a
+     virtual 2x-wide box (object-fit: contain) so the source's pixel
+     midline lines up with the cell's edge. */
+  .page-cell.half-r,
+  .page-cell.half-l {
+    position: relative;
+    overflow: hidden;
+  }
+  .page-cell.half-r img,
+  .page-cell.half-l img {
+    position: absolute;
+    top: 0;
+    width: 200%;
+    height: 100%;
+    max-width: none;
+    max-height: 100%;
+    object-fit: contain;
+  }
+  /* RTL reading: half-r is the right page of the manga, which sits in the
+     right half of the source image. Anchor the image so its right half
+     fills the cell — in pixel terms, image left edge at x = -W (cell
+     width). 'right: 0' positions the image's right edge at the cell's
+     right edge; image extends 2W to the left from there, so x ∈ [-W, W],
+     and the cell window x ∈ [0, W] shows the source's right half. */
+  .page-cell.half-r img { right: 0; left: auto; }
+  /* half-l: left half of source. 'left: 0' → image extends 2W to the
+     right, source's left half visible in the cell. */
+  .page-cell.half-l img { left: 0; right: auto; }
   .page-cell .placeholder {
     color: var(--text-dim); font-size: 13px;
     display: flex; flex-direction: column; align-items: center; gap: 10px;
@@ -424,6 +455,7 @@
     </button>
     <div class="title" id="reader-title">—</div>
     <button class="icon-btn" id="view-mode-btn" title="Toggle view mode"></button>
+    <button class="icon-btn" id="split-mode-btn" title="見開き画像を分割表示"></button>
     <button class="icon-btn hidden" id="pair-offset-btn" title="見開きペアの構成を切替">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <path d="M7 8l-4 4 4 4"/>
@@ -448,6 +480,7 @@ const STORAGE_CLIENT_ID = 'mangaStreamer.clientId';
 const STORAGE_PROGRESS_MIRROR = 'mangaStreamer.progressMirror';
 const STORAGE_LEGACY_PROGRESS = 'mangaStreamer.progress';
 const STORAGE_VIEW_MODE = 'mangaStreamer.viewMode';
+const STORAGE_SPLIT_MODE = 'mangaStreamer.splitMode';
 const STORAGE_SORT_MODE = 'mangaStreamer.sortMode';
 const PROGRESS_FILENAME = 'progress.json';
 
@@ -491,6 +524,13 @@ const state = {
 const VIEW_MODE_ICONS = {
   single: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="3" width="12" height="18" rx="1"/></svg>`,
   spread: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="8" height="18" rx="1"/><rect x="13" y="3" width="8" height="18" rx="1"/></svg>`,
+};
+
+// Split mode: when ON, each source image is treated as a 2-page spread and
+// shown as two virtual half-pages (right half first, then left, for RTL).
+const SPLIT_MODE_ICONS = {
+  off: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="1"/></svg>`,
+  on:  `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="1"/><line x1="12" y1="4" x2="12" y2="20" stroke-dasharray="2 2"/></svg>`,
 };
 
 const FULLSCREEN_ICONS = {
@@ -1977,6 +2017,11 @@ class Reader {
     this.slots = [];                 // each is array of page indices, OR ['__next__'] sentinel
     this.currentSlotIndex = 0;
     this.viewMode = localStorage.getItem(STORAGE_VIEW_MODE) || 'single';
+    // Split mode: each source image treated as a 2-page spread, shown as
+    // two virtual half-pages (right half first for RTL, then left). When ON,
+    // the slot list expands so 1 image becomes 2 slots in single view, or
+    // (since two halves of one image fill a spread) 1 slot in spread view.
+    this.splitMode = localStorage.getItem(STORAGE_SPLIT_MODE) === 'on';
     this.pairOffset = getPairOffset(file.id); // 0 = cover-alone first, 1 = pair from page 1
     this.bitmapCache = new Map();    // pageIndex -> blobUrl
     // Cache must comfortably exceed the preload window. Forward 8 + backward
@@ -2016,6 +2061,7 @@ class Reader {
     $('reader-pages').innerHTML =
       '<div class="page-slot"><div class="page-cell"><div class="placeholder"><div class="spinner small"></div>Reading archive…</div></div></div>';
     this.updateViewModeIcon();
+    this.updateSplitModeIcon();
     this.updatePairOffsetButton();
     showScreen('reader-screen');
 
@@ -2130,20 +2176,36 @@ class Reader {
   buildSlots() {
     const n = this.imageEntries.length;
     const slots = [];
-    if (this.viewMode === 'spread') {
-      let start = 0;
-      // pairOffset 0: cover stands alone, then pairs start from page index 1
-      // pairOffset 1: every page is paired starting from index 0 (no cover-alone)
-      if (this.pairOffset === 0 && n > 0) {
-        slots.push([0]);
-        start = 1;
-      }
-      for (let i = start; i < n; i += 2) {
-        if (i + 1 < n) slots.push([i, i + 1]);
-        else slots.push([i]);
+
+    // Build the linear sequence of "things to show in a cell". Without
+    // split mode, that's just the page indices 0..n-1. With split mode,
+    // each page becomes two half-page entries: right half first (RTL),
+    // then left half. We tag halves as objects {p, h} so the renderer
+    // and loader can tell them apart from regular page indices.
+    const items = [];
+    if (this.splitMode) {
+      for (let i = 0; i < n; i++) {
+        items.push({ p: i, h: 'r' });
+        items.push({ p: i, h: 'l' });
       }
     } else {
-      for (let i = 0; i < n; i++) slots.push([i]);
+      for (let i = 0; i < n; i++) items.push(i);
+    }
+
+    if (this.viewMode === 'spread') {
+      let start = 0;
+      // pairOffset 0: cover stands alone, then pairs start from index 1
+      // pairOffset 1: every entry is paired starting from index 0
+      if (this.pairOffset === 0 && items.length > 0) {
+        slots.push([items[0]]);
+        start = 1;
+      }
+      for (let i = start; i < items.length; i += 2) {
+        if (i + 1 < items.length) slots.push([items[i], items[i + 1]]);
+        else slots.push([items[i]]);
+      }
+    } else {
+      for (const it of items) slots.push([it]);
     }
     // Append a sentinel "next volume" slot at the very end. The user pages
     // into this and we offer (or auto-advance to) the following file.
@@ -2153,11 +2215,22 @@ class Reader {
     this.slots = slots;
   }
 
+  // Slot entries can be either a plain page index (number) or a half-page
+  // object {p:N, h:'r'|'l'}. This helper normalises to the underlying real
+  // page index, which is what the loader, cache, and progress tracking use.
+  _realPage(item) {
+    if (typeof item === 'number') return item;
+    if (item && typeof item === 'object' && typeof item.p === 'number') return item.p;
+    return null;
+  }
+
   findSlotForPage(pageIdx) {
     for (let i = 0; i < this.slots.length; i++) {
       const slot = this.slots[i];
       if (slot[0] === '__next__') continue;  // skip sentinel
-      if (slot.includes(pageIdx)) return i;
+      for (const it of slot) {
+        if (this._realPage(it) === pageIdx) return i;
+      }
     }
     return 0;
   }
@@ -2191,11 +2264,17 @@ class Reader {
             </div>`;
         return `<div class="page-slot next-slot" data-slot="${slotIdx}"><div class="page-cell">${inner}</div></div>`;
       }
-      const cells = pageIndices.map(p => `
-        <div class="page-cell" data-page="${p}">
+      const cells = pageIndices.map(it => {
+        // it is either a page index (number) or a half-page {p, h:'r'|'l'}
+        const p = (typeof it === 'number') ? it : it.p;
+        const half = (typeof it === 'number') ? '' : it.h;
+        const cellClass = half ? `page-cell half-${half}` : 'page-cell';
+        const halfAttr = half ? ` data-half="${half}"` : '';
+        return `
+        <div class="${cellClass}" data-page="${p}"${halfAttr}>
           <div class="placeholder"><div class="spinner small"></div></div>
-        </div>
-      `).join('');
+        </div>`;
+      }).join('');
       const slotClass = pageIndices.length > 1 ? 'page-slot spread' : 'page-slot';
       return `<div class="${slotClass}" data-slot="${slotIdx}">${cells}</div>`;
     }).join('');
@@ -2252,10 +2331,15 @@ class Reader {
       $('page-counter').textContent = this.nextFile ? '次の巻 →' : '完結';
       return;
     }
-    if (slot.length === 1) {
-      $('page-counter').textContent = `${slot[0] + 1} / ${total}`;
+    // Map slot entries to real page indices for the counter. In split mode,
+    // a slot may contain {p, h} half-page objects; we still report by
+    // 1-based real page number, which is what the user thinks of.
+    const firstPage = this._realPage(slot[0]);
+    const lastPage = this._realPage(slot[slot.length - 1]);
+    if (firstPage === lastPage) {
+      $('page-counter').textContent = `${firstPage + 1} / ${total}`;
     } else {
-      $('page-counter').textContent = `${slot[0] + 1}-${slot[slot.length - 1] + 1} / ${total}`;
+      $('page-counter').textContent = `${firstPage + 1}-${lastPage + 1} / ${total}`;
     }
   }
 
@@ -2327,7 +2411,10 @@ class Reader {
     this.updateCounter();
     this.preload();
     const slot = this.slots[this.currentSlotIndex];
-    if (slot && slot[0] !== '__next__') setProgress(this.file.id, slot[0]);
+    if (slot && slot[0] !== '__next__') {
+      const realPage = this._realPage(slot[0]);
+      if (realPage !== null) setProgress(this.file.id, realPage);
+    }
   }
 
   preload() {
@@ -2345,8 +2432,12 @@ class Reader {
     const seen = new Set();
     const addSlot = (k) => {
       if (k < 0 || k >= this.slots.length) return;
-      for (const p of this.slots[k]) {
-        if (typeof p === 'number' && !seen.has(p)) {
+      for (const it of this.slots[k]) {
+        // In split mode, both halves of the same image map to the same real
+        // page — we only want to fetch it once. _realPage handles both
+        // plain numbers and {p,h} objects.
+        const p = this._realPage(it);
+        if (p !== null && !seen.has(p)) {
           seen.add(p);
           orderedPages.push(p);
         }
@@ -2515,9 +2606,14 @@ class Reader {
     if (this.cancelled) return;
     // Scope the query to #reader-pages so we never accidentally write to a
     // cell from a different file (matters when reader was replaced mid-load).
-    const cell = $('reader-pages').querySelector(`.page-cell[data-page="${pageIndex}"]`);
-    if (cell && !cell.querySelector('img')) {
-      cell.innerHTML = `<img alt="" src="${url}">`;
+    // In split mode, the same page index appears in two cells (half-r and
+    // half-l), each showing a different portion of the same source image —
+    // we update both. querySelectorAll returns all matches.
+    const cells = $('reader-pages').querySelectorAll(`.page-cell[data-page="${pageIndex}"]`);
+    for (const cell of cells) {
+      if (!cell.querySelector('img')) {
+        cell.innerHTML = `<img alt="" src="${url}">`;
+      }
     }
   }
 
@@ -2529,8 +2625,9 @@ class Reader {
     for (let i = -BACKWARD; i <= FORWARD; i++) {
       const k = this.currentSlotIndex + i;
       if (k < 0 || k >= this.slots.length) continue;
-      for (const p of this.slots[k]) {
-        if (typeof p === 'number') protectedSet.add(p);
+      for (const it of this.slots[k]) {
+        const p = this._realPage(it);
+        if (p !== null) protectedSet.add(p);
       }
     }
     return protectedSet;
@@ -2560,7 +2657,7 @@ class Reader {
 
   setViewMode(mode) {
     if (mode === this.viewMode) return;
-    const currentPage = (this.slots[this.currentSlotIndex] || [0])[0];
+    const currentPage = this._realPage((this.slots[this.currentSlotIndex] || [0])[0]) || 0;
     this.viewMode = mode;
     localStorage.setItem(STORAGE_VIEW_MODE, mode);
     this.updateViewModeIcon();
@@ -2579,9 +2676,32 @@ class Reader {
     this.setViewMode(this.viewMode === 'single' ? 'spread' : 'single');
   }
 
+  // Toggle split mode: when ON, every source image is treated as a 2-page
+  // spread and rendered as two virtual half-pages (right half first for RTL).
+  // Useful for archives where the original scanner left two pages joined.
+  toggleSplitMode() {
+    const currentPage = this._realPage((this.slots[this.currentSlotIndex] || [0])[0]) || 0;
+    this.splitMode = !this.splitMode;
+    localStorage.setItem(STORAGE_SPLIT_MODE, this.splitMode ? 'on' : 'off');
+    this.updateSplitModeIcon();
+    this.buildSlots();
+    this.currentSlotIndex = this.findSlotForPage(currentPage);
+    this.renderSlots();
+    requestAnimationFrame(() => {
+      this.scrollToSlot(this.currentSlotIndex, false);
+      this.updateCounter();
+      this.preload();
+    });
+    // Re-attach already-cached images so the half-page CSS applies
+    for (const [pageIdx, url] of this.bitmapCache) {
+      this.attachImage(pageIdx, url);
+    }
+    toast(this.splitMode ? '見開き分割: ON' : '見開き分割: OFF', 1200);
+  }
+
   togglePairOffset() {
     if (this.viewMode !== 'spread') return;
-    const currentPage = (this.slots[this.currentSlotIndex] || [0])[0];
+    const currentPage = this._realPage((this.slots[this.currentSlotIndex] || [0])[0]) || 0;
     this.pairOffset = this.pairOffset === 0 ? 1 : 0;
     setProgress(this.file.id, currentPage, { pairOffset: this.pairOffset });
     this.buildSlots();
@@ -2600,6 +2720,16 @@ class Reader {
     const next = this.viewMode === 'single' ? 'spread' : 'single';
     $('view-mode-btn').innerHTML = VIEW_MODE_ICONS[next];
     $('view-mode-btn').title = next === 'spread' ? 'Switch to spread view' : 'Switch to single page';
+  }
+
+  updateSplitModeIcon() {
+    // Show the state-of-button icon: 'on' icon when split mode is active,
+    // 'off' otherwise. The button always toggles between the two states.
+    const btn = $('split-mode-btn');
+    if (!btn) return;
+    btn.innerHTML = SPLIT_MODE_ICONS[this.splitMode ? 'on' : 'off'];
+    btn.title = this.splitMode ? '見開き分割: ON (タップで解除)' : '見開き分割: OFF (タップで分割)';
+    btn.classList.toggle('active', this.splitMode);
   }
 
   updatePairOffsetButton() {
@@ -2817,6 +2947,9 @@ function wireReader() {
   $('reader-close').addEventListener('click', navBack);
   $('view-mode-btn').addEventListener('click', () => {
     if (state.reader) state.reader.toggleViewMode();
+  });
+  $('split-mode-btn').addEventListener('click', () => {
+    if (state.reader) state.reader.toggleSplitMode();
   });
   $('pair-offset-btn').addEventListener('click', () => {
     if (state.reader) state.reader.togglePairOffset();
