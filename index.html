@@ -608,10 +608,64 @@ function makeSortComparator() {
   switch (mode) {
     case 'name_asc':       return (a, b) => naturalCompare(a.name, b.name);
     case 'name_desc':      return (a, b) => naturalCompare(b.name, a.name);
-    case 'modified_desc':  return (a, b) => (b.modifiedTime || '').localeCompare(a.modifiedTime || '');
-    case 'modified_asc':   return (a, b) => (a.modifiedTime || '').localeCompare(b.modifiedTime || '');
+    case 'modified_desc':  return (a, b) => effectiveModifiedTime(b).localeCompare(effectiveModifiedTime(a));
+    case 'modified_asc':   return (a, b) => effectiveModifiedTime(a).localeCompare(effectiveModifiedTime(b));
     default:               return (a, b) => naturalCompare(a.name, b.name);
   }
+}
+
+// Drive's folder modifiedTime only reflects the folder's own metadata
+// changes (renames, moves) — adding a file inside a folder does NOT
+// reliably update its modifiedTime, especially in Shared Drives. So
+// sorting folders by raw modifiedTime gives stale results that don't
+// match what a user means by "most recently added manga".
+//
+// Workaround: peek inside each folder for the most recently modified
+// direct child and use that as the folder's effective modifiedTime.
+// Results are cached in-memory for the session via _folderPeekCache.
+function effectiveModifiedTime(f) {
+  if (f && f._effectiveModifiedTime) return f._effectiveModifiedTime;
+  return (f && f.modifiedTime) || '';
+}
+
+const _folderPeekCache = new Map(); // folderId -> ISO timestamp string (or '' if empty)
+
+async function peekFolderModified(folderId) {
+  if (_folderPeekCache.has(folderId)) return _folderPeekCache.get(folderId);
+  const params = new URLSearchParams({
+    q: `'${folderId}' in parents and trashed = false`,
+    fields: 'files(modifiedTime)',
+    pageSize: '1',
+    orderBy: 'modifiedTime desc',
+    spaces: 'drive',
+    supportsAllDrives: 'true',
+    includeItemsFromAllDrives: 'true',
+  });
+  try {
+    const resp = await driveFetch('https://www.googleapis.com/drive/v3/files?' + params);
+    if (!resp.ok) {
+      _folderPeekCache.set(folderId, '');
+      return '';
+    }
+    const data = await readBodyJson(resp);
+    const ts = (data.files && data.files[0] && data.files[0].modifiedTime) || '';
+    _folderPeekCache.set(folderId, ts);
+    return ts;
+  } catch {
+    _folderPeekCache.set(folderId, '');
+    return '';
+  }
+}
+
+async function enrichFolderModifiedTimes(files) {
+  // Run peeks in parallel; the global Drive concurrency gate keeps the
+  // total in-flight count safe. Folders without inner content keep their
+  // raw modifiedTime via effectiveModifiedTime's fallback.
+  const folders = files.filter(isFolder);
+  await Promise.all(folders.map(async f => {
+    const ts = await peekFolderModified(f.id);
+    if (ts) f._effectiveModifiedTime = ts;
+  }));
 }
 
 function relTime(ts) {
@@ -1803,6 +1857,14 @@ async function loadCurrentFolder() {
     }
 
     const filtered = all.filter(f => isFolder(f) || isZip(f));
+    // For modified-time sort modes, peek into each folder for its most
+    // recently-modified child and use that as the folder's effective
+    // modifiedTime. Without this, folders sort by their own (often stale)
+    // metadata-change time rather than by when their contents changed.
+    const mode = getSortMode();
+    if (mode === 'modified_desc' || mode === 'modified_asc') {
+      await enrichFolderModifiedTimes(filtered);
+    }
     const cmp = makeSortComparator();
     filtered.sort((a, b) => {
       // Shared folders first, then own folders, then ZIP files.
@@ -1825,6 +1887,10 @@ async function runSearch(query) {
   try {
     const all = await searchDrive(query);
     const filtered = all.filter(f => isFolder(f) || isZip(f));
+    const mode = getSortMode();
+    if (mode === 'modified_desc' || mode === 'modified_asc') {
+      await enrichFolderModifiedTimes(filtered);
+    }
     const cmp = makeSortComparator();
     filtered.sort((a, b) => {
       // ZIPs first (the more useful target in search), then folders.
@@ -2975,10 +3041,17 @@ function wireBrowser() {
   $('signout-btn').addEventListener('click', signOut);
   updateSortButton();
 
-  $('sort-btn').addEventListener('click', () => {
+  $('sort-btn').addEventListener('click', async () => {
     const next = cycleSortMode();
     toast(SORT_LABELS[next], 1200);
-    // Re-sort whichever list is currently shown without re-fetching from Drive
+    // If we just switched to a modified-time sort, peek inside each folder
+    // for its real "most recent change" timestamp before re-sorting. Cached,
+    // so flipping back and forth is fast.
+    const needsEnrich = next === 'modified_desc' || next === 'modified_asc';
+    if (needsEnrich) {
+      const list = state.searching ? state.searchResults : state.currentFiles;
+      if (list && list.length) await enrichFolderModifiedTimes(list);
+    }
     const cmp = makeSortComparator();
     if (state.history) {
       // History uses its own sort (always by recency), so just re-render
