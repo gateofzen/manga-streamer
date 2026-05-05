@@ -477,6 +477,7 @@
 //===========================================================================
 const SCOPE = 'https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.appdata';
 const STORAGE_CLIENT_ID = 'mangaStreamer.clientId';
+const STORAGE_TOKEN = 'mangaStreamer.token'; // {accessToken, expiresAt} JSON
 const STORAGE_PROGRESS_MIRROR = 'mangaStreamer.progressMirror';
 const STORAGE_LEGACY_PROGRESS = 'mangaStreamer.progress';
 const STORAGE_VIEW_MODE = 'mangaStreamer.viewMode';
@@ -667,10 +668,79 @@ function initTokenClient() {
       if (resp.error) { toast('Sign-in failed: ' + resp.error); return; }
       state.accessToken = resp.access_token;
       state.tokenExpiresAt = Date.now() + (resp.expires_in - 60) * 1000;
-      onSignedIn();
+      saveStoredToken();
+      scheduleProactiveTokenRefresh();
+      // Only navigate to the browser screen on the FIRST sign-in (i.e. when
+      // we were sitting on the signin screen). Mid-session token refreshes
+      // — including the proactive 5-min-before-expiry refresh — must not
+      // tear down the Reader the user is currently looking at.
+      const isInitialSignIn = !$('signin-screen').classList.contains('hidden');
+      if (isInitialSignIn) onSignedIn();
     },
   });
   return true;
+}
+
+// Persist the access token + expiry across sessions so that closing and
+// reopening the app within the 1-hour window doesn't force the user back
+// to the sign-in screen. The token itself is short-lived and bound to the
+// Drive read-only scope, so storing it in localStorage is acceptable —
+// effectively the same security model as a "remember me" cookie.
+function saveStoredToken() {
+  try {
+    if (!state.accessToken || !state.tokenExpiresAt) {
+      localStorage.removeItem(STORAGE_TOKEN);
+      return;
+    }
+    localStorage.setItem(STORAGE_TOKEN, JSON.stringify({
+      accessToken: state.accessToken,
+      expiresAt: state.tokenExpiresAt,
+    }));
+  } catch {}
+}
+
+function loadStoredToken() {
+  try {
+    const raw = localStorage.getItem(STORAGE_TOKEN);
+    if (!raw) return false;
+    const obj = JSON.parse(raw);
+    // Require ≥30s of remaining lifetime. If less, force a refresh —
+    // we don't want a fetch to fire and have the token expire mid-flight.
+    if (!obj || !obj.accessToken || !obj.expiresAt || obj.expiresAt - Date.now() < 30000) {
+      return false;
+    }
+    state.accessToken = obj.accessToken;
+    state.tokenExpiresAt = obj.expiresAt;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Schedule a silent token refresh ~5 min before the token expires. By the
+// time the user returns to read more, the token has already been rotated
+// and there's no perceptible auth UI. We track the timeout id so a fresh
+// callback can replace any prior schedule.
+let _proactiveRefreshTimer = null;
+function scheduleProactiveTokenRefresh() {
+  if (_proactiveRefreshTimer) clearTimeout(_proactiveRefreshTimer);
+  if (!state.tokenExpiresAt) return;
+  // Aim for 5 min before expiry; clamp to at least 10s in the future so we
+  // don't busy-loop if a token comes in already near-expired.
+  const ms = Math.max(10_000, state.tokenExpiresAt - Date.now() - 5 * 60_000);
+  _proactiveRefreshTimer = setTimeout(() => {
+    _proactiveRefreshTimer = null;
+    // ensureToken will detect the token isn't valid yet (we're 5 min out
+    // but the cached check uses Date.now() < tokenExpiresAt, so it would
+    // still consider it valid). Force a refresh by clearing the cache:
+    state.tokenExpiresAt = 0;
+    ensureToken().catch(err => {
+      console.warn('Proactive token refresh failed:', err);
+      // Try again in 30s. If the user actually clicks something soon,
+      // ensureToken from a real fetch will wake up the refresh too.
+      _proactiveRefreshTimer = setTimeout(scheduleProactiveTokenRefresh, 30_000);
+    });
+  }, ms);
 }
 
 // Concurrent-safe token refresh. Multiple parallel fetches that all hit a
@@ -746,6 +816,13 @@ function signOut() {
   state.tokenExpiresAt = 0;
   state.progress = { version: 1, files: {} };
   state.progressFileId = null;
+  // Clear the persisted token and cancel any pending background refresh,
+  // otherwise the next app open would silently sign back in.
+  try { localStorage.removeItem(STORAGE_TOKEN); } catch {}
+  if (_proactiveRefreshTimer) {
+    clearTimeout(_proactiveRefreshTimer);
+    _proactiveRefreshTimer = null;
+  }
   showScreen('signin-screen');
 }
 
@@ -2822,11 +2899,24 @@ function wireSignIn() {
     requestSignIn(true);  // explicit user action → fall back to consent prompt
   });
 
-  // Auto sign-in: if a Client ID is saved, skip the manual button entirely.
-  // Tries a silent token request first (no UI if user already consented),
-  // falls back to showing the input only on failure.
+  // First, try to skip the signin screen entirely using a stored token.
+  // This is the fast-path for "user closed the tab and reopened it within
+  // the 1-hour validity window" — no Google round-trip needed at all.
   if (saved) {
     state.clientId = saved;
+    if (loadStoredToken()) {
+      // Token valid; jump straight to the file browser. We still init
+      // the GIS client in the background (when GIS finishes loading) so
+      // ensureToken can refresh silently when this token does expire.
+      scheduleProactiveTokenRefresh();
+      onSignedIn();
+      // Lazily prepare tokenClient for future refreshes
+      const wait = setInterval(() => {
+        if (initTokenClient() || !state.clientId) clearInterval(wait);
+      }, 100);
+      return;
+    }
+    // No valid stored token → fall through to GIS silent attempt
     autoSignIn();
   }
 }
