@@ -960,83 +960,73 @@ let _tokenRefreshPromise = null;
 // Drive backend's queue. 8 is empirically a sweet spot: enough parallelism
 // to keep the link saturated, low enough that one user can't trip Drive's
 // per-user rate limiter on a slow connection.
-const DRIVE_MAX_INFLIGHT = 8;
-let _driveActiveCount = 0;
-// Priority queue: foreground page loads (priority 0) jump the line ahead
-// of thumbnails (priority 1), prefetch waves (priority 2), and background
-// fill (priority 3). Each queue level is FIFO within itself. This means
-// the page the user is staring at always gets bandwidth first, even when
-// dozens of background fetches are pending.
+// Drive gate: per-priority caps so foreground page loads, thumbnails, and
+// prefetch can all make progress in parallel without one starving another.
+// A small total cap means each active stream gets more bandwidth, which
+// makes the FIRST things to land (visible page, visible thumbs) come back
+// much faster than maximizing parallelism would.
+//
+// The key trick that makes "jump destination loads fast" actually work is
+// not the per-priority caps alone — it's that we kick off a single big
+// coalesced prefetch (the "instant wave", priority 0) that covers the
+// visible page bytes AND the bytes for ~5 surrounding pages (which the
+// thumbnail strip needs). One Drive request returns ~2 MB of contiguous
+// ZIP bytes, then both the foreground page read AND every visible thumb
+// read hit the buffer and return without any further network at all.
+//
+// Caps:
+//   P0 (foreground page loads + instant prefetch wave): up to 2 slots
+//   P1 (thumbnails):                                     up to 2 slots
+//   P2 (forward prefetch wave):                          up to 1 slot
+//   P3 (background fill):                                up to 1 slot
+//   Total cap:                                           4
 const DRIVE_PRIORITY_LEVELS = 4;
+const DRIVE_TOTAL_CAP = 4;
+const DRIVE_PRIORITY_CAPS = [2, 2, 1, 1];
+
+let _driveActive = 0;
+const _driveActiveByPriority = [0, 0, 0, 0];
 const _driveWaitQueues = Array.from({ length: DRIVE_PRIORITY_LEVELS }, () => []);
 
-// Critical mode: temporarily restricts the effective max concurrency so
-// that the jump destination page (or initially opened page) can grab
-// most of the bandwidth and load fast. While critical, only 2 slots are
-// available regardless of priority — this concentrates bandwidth onto
-// the first 2 requests (typically the destination page + one forward),
-// achieving ~5x faster visible-page latency on contended connections.
-// Lifted when the destination page finishes loading or after a 3s
-// failsafe timeout.
-let _driveCritical = false;
-const DRIVE_CRITICAL_CAP = 2;
-
-function _driveEffectiveCap() {
-  return _driveCritical ? DRIVE_CRITICAL_CAP : DRIVE_MAX_INFLIGHT;
-}
-
-function setDriveCritical(on) {
-  const wasOn = _driveCritical;
-  _driveCritical = !!on;
-  // When lifting the cap, immediately wake as many waiters as possible
-  // so the slots that just became available are used right away.
-  if (wasOn && !_driveCritical) {
-    while (_driveActiveCount < DRIVE_MAX_INFLIGHT) {
-      let woke = false;
-      for (let p = 0; p < DRIVE_PRIORITY_LEVELS; p++) {
-        const q = _driveWaitQueues[p];
-        if (q.length > 0) {
-          const next = q.shift();
-          _driveActiveCount++;
-          next();
-          woke = true;
-          break;
-        }
-      }
-      if (!woke) break;
-    }
-  }
+function _driveCanGrant(p) {
+  return _driveActive < DRIVE_TOTAL_CAP
+      && _driveActiveByPriority[p] < DRIVE_PRIORITY_CAPS[p];
 }
 
 function _driveAcquire(priority = 1) {
+  const p = Math.max(0, Math.min(DRIVE_PRIORITY_LEVELS - 1, priority | 0));
   return new Promise(resolve => {
-    if (_driveActiveCount < _driveEffectiveCap()) {
-      _driveActiveCount++;
-      resolve();
+    if (_driveCanGrant(p)) {
+      _driveActive++;
+      _driveActiveByPriority[p]++;
+      resolve(p);
     } else {
-      const p = Math.max(0, Math.min(DRIVE_PRIORITY_LEVELS - 1, priority | 0));
       _driveWaitQueues[p].push(resolve);
     }
   });
 }
 
-function _driveRelease() {
-  _driveActiveCount--;
-  // Only wake a waiter if we're still under the effective cap (which
-  // might be the lowered critical-mode cap).
-  if (_driveActiveCount >= _driveEffectiveCap()) return;
-  // Scan queues from highest priority (0) down — pick the first one
-  // with a waiter.
-  for (let p = 0; p < DRIVE_PRIORITY_LEVELS; p++) {
-    const q = _driveWaitQueues[p];
-    if (q.length > 0) {
+function _driveRelease(p) {
+  _driveActive--;
+  _driveActiveByPriority[p]--;
+  // Wake the highest-priority waiter that has capacity for. Scan from P0
+  // down — if P0 can be granted, do it; else try P1, etc.
+  for (let pp = 0; pp < DRIVE_PRIORITY_LEVELS; pp++) {
+    const q = _driveWaitQueues[pp];
+    if (q.length > 0 && _driveCanGrant(pp)) {
       const next = q.shift();
-      _driveActiveCount++;
-      next();
+      _driveActive++;
+      _driveActiveByPriority[pp]++;
+      next(pp);
       return;
     }
   }
 }
+
+// Compat shim: legacy callers of setDriveCritical (kept so the rest of
+// the file doesn't have to be rewritten). It now does nothing — critical
+// mode was replaced by the instant prefetch wave.
+function setDriveCritical(on) { /* no-op */ }
 
 function ensureToken() {
   if (state.accessToken && Date.now() < state.tokenExpiresAt) return Promise.resolve();
@@ -1094,11 +1084,11 @@ function signOut() {
 async function driveFetch(url, init = {}) {
   const tag = '[driveFetch ' + Math.random().toString(36).substring(2, 7) + ']';
   console.log(tag, 'enter', url.substring(0, 80));
-  await _driveAcquire(init.priority);
+  const p = await _driveAcquire(init.priority);
   try {
     return await _driveFetchInner(url, init, tag);
   } finally {
-    _driveRelease();
+    _driveRelease(p);
   }
 }
 
@@ -2932,10 +2922,9 @@ class Reader {
   // it — the reader proceeds and individual loadPage calls naturally hit
   // the buffer once it lands.
   _fireInitialPrefetch(startPage) {
-    // Initial open is just a special-case "jump" from nothing → startPage,
-    // so it gets the same critical-mode treatment: the cover page hogs
-    // bandwidth until it loads, then everything else fans out.
-    this._beginJumpCritical(startPage);
+    // Initial open is just a special-case "jump" from nothing → startPage.
+    // The instant prefetch wave inside _launchPrefetchAround takes care
+    // of priming the buffer for visible page + visible thumbnails.
     this._launchPrefetchAround(startPage, /*initial=*/true);
   }
 
@@ -2990,30 +2979,44 @@ class Reader {
     const signal = this._prefetchAbort.signal;
     this._prefetchCenter = centerPage;
 
-    // KEY INSIGHT: priorities solve most of the bandwidth contention by
-    // making foreground reads jump ahead of prefetch in the Drive queue.
-    // But we ALSO add a small delay before starting the prefetch so the
-    // foreground reads can grab their slots first, then bandwidth stays
-    // mostly with them while their bytes are arriving. The prefetch then
-    // fills in over the following second or two.
+    // INSTANT prefetch: covers centerPage-2 ... centerPage+5, ~3 MB.
+    // Priority 0 — same as foreground loadPage — so it goes into a gate
+    // slot RIGHT NOW with no other competition. With per-priority caps
+    // P0=2, this fits alongside the visible page's individual loadPage
+    // fetch. (HTTP/2 mux: both run in parallel, sharing bandwidth.)
     //
-    // Tier 1 starts at centerPage+5 — past the foreground preload window
-    // (which covers centerPage, +1..+4 and centerPage-1). No redundant
-    // bytes downloaded.
-    const startPage = Math.min(this.imageEntries.length - 1, centerPage + 5);
+    // Why this works: ZIP entries for adjacent pages are byte-contiguous,
+    // so one ranged fetch returns the data for ALL of pages centerPage-2
+    // through centerPage+5. That single landing chunk satisfies:
+    //   - the visible page's readEntry (hits buffer instantly)
+    //   - the next few foreground lookahead pages (hit buffer)
+    //   - the visible thumbnails' readEntry (hit buffer)
+    // Without this, each of those ~10 pages would be a separate Drive
+    // request, each paying ~200 ms RTT — 2 seconds of RTT overhead alone.
+    const instantStart = Math.max(0, centerPage - 2);
+    const instantEntry = this.imageEntries[instantStart];
+    if (instantEntry) {
+      const idx = this.zip.entries.indexOf(instantEntry);
+      if (idx >= 0) {
+        this.zip.prefetchEntriesFrom(idx, 3 * 1024 * 1024, signal, 0).catch(() => {});
+      }
+    }
+
+    // FORWARD prefetch wave: covers centerPage+6 ... centerPage+25.
+    // Priority 2 (lower) and slightly delayed so the instant wave gets
+    // bandwidth first. Provides "next ~20 pages ready" for smooth forward
+    // paging without contending with the destination's visible content.
+    const startPage = Math.min(this.imageEntries.length - 1, centerPage + 6);
     const startEntry = this.imageEntries[startPage];
     if (!startEntry) return;
     const startIdx = this.zip.entries.indexOf(startEntry);
     if (startIdx < 0) return;
 
-    const delay = initial ? 600 : 400;
+    const delay = initial ? 800 : 600;
     this._prefetchStartTimer = setTimeout(() => {
       this._prefetchStartTimer = null;
       if (this.cancelled || signal.aborted) return;
 
-      // Prefetch a fat chunk (8 MB) of compressed pages at priority 2.
-      // Background fill (priority 3) starts after this lands so the wave
-      // and the fill don't fight each other.
       const tier1 = this.zip.prefetchEntriesFrom(
         startIdx, 8 * 1024 * 1024, signal, 2
       ).catch(() => {});
@@ -3308,10 +3311,14 @@ class Reader {
   }
 
   preload() {
-    // Tighter window means fewer competing fetches and faster turnaround
-    // for the visible page. We can afford this because the abort logic
-    // means stale fetches release their slot when user scrolls past.
-    const FORWARD = 4;
+    // During the critical-bandwidth window after a jump, we ONLY preload
+    // Preload the visible page plus a short window of forward/backward
+    // neighbors. With per-priority gate caps (P0 max=2), only 2 of these
+    // actually fetch from Drive at a time — extras wait in the P0 queue
+    // until earlier ones release their slot. So the queue size mostly
+    // dictates "what gets fetched eventually", not "what fights for
+    // bandwidth right now".
+    const FORWARD = 3;
     const BACKWARD = 1;
 
     // Build the page list in strict priority order: current slot first
@@ -3511,20 +3518,6 @@ class Reader {
     // blob URL — the strip just shows it at small size with object-fit:cover.
     // No extra network or decode cost; the browser caches the decoded bitmap.
     this.populateThumbnail(pageIndex, url);
-
-    // If this is the page the user jumped to (or just opened the book on),
-    // lift the Drive critical cap so the rest of the work (preload window,
-    // thumbnails, prefetch wave) can fan out across all 8 slots. This is
-    // the single biggest UX lever: visible page gets near-exclusive bandwidth
-    // until it lands, then everything else can proceed at full parallelism.
-    if (this._jumpDestPage === pageIndex) {
-      this._jumpDestPage = null;
-      if (this._criticalTimer) {
-        clearTimeout(this._criticalTimer);
-        this._criticalTimer = null;
-      }
-      setDriveCritical(false);
-    }
   }
 
   // ---------------- Thumbnail strip + page jump ----------------
@@ -3876,31 +3869,40 @@ class Reader {
     const slotIdx = this.findSlotForPage(p);
     if (slotIdx === this.currentSlotIndex) return;
     this.currentSlotIndex = slotIdx;
-    // Set up the critical-bandwidth window for this jump. Aborts old
-    // stale fetches, narrows the Drive gate to 2 slots so the destination
-    // page can dominate bandwidth, and arms a failsafe timer in case the
-    // page never lands (e.g. decode error).
-    this._beginJumpCritical(p);
-    // Cancel any in-flight prefetch wave from the previous location and
-    // schedule a new one centred on the jump destination. Note: the
-    // prefetch wave is deferred 400ms and runs at lower priority, so it
-    // won't compete with the foreground destination page.
+    // Abort everything that was loading for the OLD region so its slots
+    // free up immediately and the new region's traffic gets bandwidth
+    // and Drive concurrency from the very first millisecond. Old work
+    // includes: in-flight foreground page loads, in-flight thumbnail
+    // fetches, the previous prefetch wave, and the background fill.
+    this._abortOldWork(p);
+    // Launch the new prefetch wave (instant P0 wave + forward P2 wave +
+    // background fill). The instant wave coalesces the bytes for visible
+    // page + visible thumbnails into a single Drive request so both
+    // appear together within ~1 RTT after the jump.
     this._launchPrefetchAround(p);
     this.scrollToSlot(slotIdx, false);
     this._settleSlot();
   }
 
-  // Set up the critical-bandwidth window for a jump (or initial open).
-  // Aborts everything that was loading for the old region, restricts the
-  // Drive gate to 2 slots, and arms a failsafe so we don't get stuck in
-  // critical mode if the destination page fails to load.
-  _beginJumpCritical(destPage) {
-    // Cancel previous critical-mode timer if jump is being repeated.
-    if (this._criticalTimer) clearTimeout(this._criticalTimer);
-    // Abort all in-flight thumbnail fetches — they're for thumbs that
-    // are no longer visible (strip just scrolled to the new center).
-    // The IntersectionObserver will re-queue thumb fetches for the new
-    // visible thumbs on the next animation frame.
+  // Abort in-flight work that's for the OLD region around the previous
+  // page position so it stops competing with the new region's traffic.
+  // Called from jumpToPage before launching new prefetch waves.
+  _abortOldWork(newDestPage) {
+    // Foreground page loads: abort any for pages outside the upcoming
+    // preload window. preload() will also do this but we want slots
+    // freed RIGHT NOW for the instant prefetch wave.
+    if (this._inflightAborts) {
+      for (const [page, ctl] of this._inflightAborts) {
+        if (Math.abs(page - newDestPage) > 4) {
+          try { ctl.abort(); } catch {}
+          this._inflightAborts.delete(page);
+        }
+      }
+    }
+    // Thumbnail fetches: abort all. IntersectionObserver will re-queue
+    // visible thumbs for the new strip position on the next animation
+    // frame, and they'll mostly hit the buffer pool once the instant
+    // prefetch wave lands.
     if (this._thumbAborts) {
       for (const ctl of this._thumbAborts.values()) {
         try { ctl.abort(); } catch {}
@@ -3908,26 +3910,6 @@ class Reader {
       this._thumbAborts.clear();
     }
     if (this._thumbInflight) this._thumbInflight.clear();
-    // Abort all in-flight foreground page loads for pages OTHER than the
-    // destination. (preload() will also do this, but we want to free the
-    // slots NOW so the destination's fetch can start without competition.)
-    if (this._inflightAborts) {
-      for (const [page, ctl] of this._inflightAborts) {
-        if (page !== destPage) {
-          try { ctl.abort(); } catch {}
-          this._inflightAborts.delete(page);
-        }
-      }
-    }
-    this._jumpDestPage = destPage;
-    setDriveCritical(true);
-    // Failsafe: even if attachImage never fires (page errors out, etc),
-    // lift critical mode after 3 seconds so the reader doesn't stall.
-    this._criticalTimer = setTimeout(() => {
-      this._criticalTimer = null;
-      this._jumpDestPage = null;
-      setDriveCritical(false);
-    }, 3000);
   }
 
   // Returns a Set of page indices that should NOT be evicted from cache —
@@ -4079,14 +4061,6 @@ class Reader {
       clearTimeout(this._prefetchStartTimer);
       this._prefetchStartTimer = null;
     }
-    // Lift the Drive critical cap so the next reader starts with full
-    // parallelism available. Also clear the failsafe timer.
-    if (this._criticalTimer) {
-      clearTimeout(this._criticalTimer);
-      this._criticalTimer = null;
-    }
-    this._jumpDestPage = null;
-    setDriveCritical(false);
     for (const url of this.bitmapCache.values()) URL.revokeObjectURL(url);
     this.bitmapCache.clear();
     this.loading.clear();
@@ -4529,107 +4503,3 @@ function wireReader() {
 //
 // Strategy: each forward navigation (entering a folder, opening a file,
 // entering search/history mode) calls pushNav() which adds a marked entry
-// to history.state. On popstate we look at the new state.depth — if it's
-// less than what we last pushed, the user went back, so we step back inside
-// the app. Going back past depth 0 lets the browser leave naturally.
-
-let navDepth = 0;
-
-function initNav() {
-  // Mark the initial entry so we can recognize "our" history entries.
-  if (!history.state || history.state.app !== 'mangaStreamer') {
-    history.replaceState({ app: 'mangaStreamer', depth: 0 }, '', location.href);
-  } else {
-    navDepth = history.state.depth || 0;
-  }
-  window.addEventListener('popstate', onPopState);
-}
-
-function pushNav() {
-  navDepth++;
-  history.pushState({ app: 'mangaStreamer', depth: navDepth }, '', location.href);
-}
-
-function onPopState(e) {
-  const target = (e.state && e.state.app === 'mangaStreamer')
-    ? (e.state.depth | 0)
-    : 0;
-  if (target < navDepth) {
-    navDepth = target;
-    handleSystemBack();
-  }
-  // target > navDepth (forward navigation) is ignored; we don't restore
-  // forward state because each pushNav represents a one-way transition.
-}
-
-function handleSystemBack() {
-  // Order matches navigation precedence: innermost screens close first.
-  if (!$('reader-screen').classList.contains('hidden')) {
-    closeReader();
-    return;
-  }
-  if (state.history) {
-    loadCurrentFolder();
-    return;
-  }
-  if (state.searching || !$('search-box').classList.contains('hidden')) {
-    $('search-input').value = '';
-    loadCurrentFolder();
-    return;
-  }
-  if (state.folderStack.length > 1) {
-    state.folderStack.pop();
-    loadCurrentFolder();
-    return;
-  }
-  // At root: nothing to do. The next swipe-back will leave the page.
-}
-
-function navBack() {
-  // Internal "back" trigger used by close buttons, Esc key, etc.
-  // Routes through history so popstate is the single source of truth.
-  if (navDepth > 0) {
-    history.back();
-  } else {
-    // Already at app root — nothing to undo
-    toast('Already at top');
-  }
-}
-
-window.addEventListener('DOMContentLoaded', () => {
-  // Global safety net: if startup throws something we didn't anticipate
-  // (corrupt localStorage, missing DOM, GIS load failure, etc.) we DON'T
-  // want the user staring at a half-rendered black screen. This handler
-  // forces the sign-in form back into view and dismisses the loading
-  // spinner. The user can then click Sign In (or clear data) to retry.
-  const recover = (label) => (ev) => {
-    const err = ev && (ev.error || ev.reason || ev.message) || '(unknown)';
-    console.error('[startup recovery]', label, err);
-    try {
-      const ss = document.getElementById('signin-screen');
-      const bs = document.getElementById('browser-screen');
-      const rs = document.getElementById('reader-screen');
-      if (ss) ss.classList.remove('hidden');
-      if (bs) bs.classList.add('hidden');
-      if (rs) rs.classList.add('hidden');
-      const sf = document.getElementById('signin-form');
-      const ss2 = document.getElementById('auto-signin-status');
-      if (sf) sf.classList.remove('hidden');
-      if (ss2) ss2.classList.add('hidden');
-    } catch {}
-  };
-  window.addEventListener('error', recover('window.error'));
-  window.addEventListener('unhandledrejection', recover('unhandledrejection'));
-
-  try {
-    initNav();
-    wireSignIn();
-    wireBrowser();
-    wireReader();
-  } catch (err) {
-    recover('DOMContentLoaded sync')({ error: err });
-  }
-});
-</script>
-</body>
-</html>
