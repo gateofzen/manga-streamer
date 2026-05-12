@@ -683,6 +683,24 @@ function toast(msg, ms = 2400) {
   clearTimeout(toast._t);
   toast._t = setTimeout(() => el.classList.remove('show'), ms);
 }
+// Schedule a callback to run when the browser is idle, falling back to
+// a polite setTimeout on browsers without requestIdleCallback. The
+// returned handle can be passed to cancelIdle().
+function scheduleIdle(cb, options = { timeout: 2000 }) {
+  if (typeof requestIdleCallback === 'function') {
+    return { type: 'idle', id: requestIdleCallback(cb, options) };
+  }
+  return { type: 'timeout', id: setTimeout(cb, 300) };
+}
+function cancelIdle(handle) {
+  if (!handle) return;
+  if (handle.type === 'idle' && typeof cancelIdleCallback === 'function') {
+    try { cancelIdleCallback(handle.id); } catch {}
+  } else if (handle.type === 'timeout') {
+    clearTimeout(handle.id);
+  }
+}
+
 function naturalCompare(a, b) {
   return a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
 }
@@ -1509,7 +1527,12 @@ class ZipReader {
     this._chunks = [];                  // Array<{start, end, bytes}>
     this._chunkInflight = new Map();    // start -> Promise<Uint8Array>
     this._chunkBytesTotal = 0;          // running total for eviction
-    this._chunkBudget = 32 * 1024 * 1024;  // 32 MB cap (mobile-friendly)
+    // 96 MB budget: enough to hold an entire typical manga volume
+    // (50-150 MB) for the back-paging case, while staying well within
+    // mobile memory limits. Eviction is distance-from-user aware so
+    // chunks far from the current page are dropped first.
+    this._chunkBudget = 96 * 1024 * 1024;
+    this._centerByteOffset = 0;
   }
 
   // Look up a requested byte range in the cached chunks. Returns a
@@ -1537,12 +1560,31 @@ class ZipReader {
     });
     this._chunks.push({ start, end, bytes });
     this._chunkBytesTotal += bytes.length;
-    // Evict oldest until under budget. We keep at least one chunk so
-    // a single very-large prefetch can still satisfy lookups.
+    // Evict if over budget. Prefer evicting chunks farthest from the
+    // user's current read position (set via setCenterByteOffset) so the
+    // most-likely-needed bytes stay in memory. Keep at least one chunk
+    // so a single very-large prefetch can still satisfy lookups.
     while (this._chunkBytesTotal > this._chunkBudget && this._chunks.length > 1) {
-      const evicted = this._chunks.shift();
+      const center = this._centerByteOffset ?? 0;
+      // Find the chunk whose centre is furthest from the user's center.
+      let worstIdx = 0;
+      let worstDist = -1;
+      for (let i = 0; i < this._chunks.length; i++) {
+        const c = this._chunks[i];
+        const chunkMid = (c.start + c.end) / 2;
+        const dist = Math.abs(chunkMid - center);
+        if (dist > worstDist) { worstDist = dist; worstIdx = i; }
+      }
+      const evicted = this._chunks.splice(worstIdx, 1)[0];
       this._chunkBytesTotal -= evicted.bytes.length;
     }
+  }
+
+  // Inform the buffer pool which byte offset corresponds to the user's
+  // current reading position. Used by the eviction policy to keep
+  // nearby chunks resident.
+  setCenterByteOffset(offset) {
+    this._centerByteOffset = offset;
   }
 
   // Fetch a chunk of the ZIP and stash it for later reads. Coalesces
@@ -2832,25 +2874,7 @@ class Reader {
   // it — the reader proceeds and individual loadPage calls naturally hit
   // the buffer once it lands.
   _fireInitialPrefetch(startPage) {
-    if (!this.zip || !this.imageEntries.length) return;
-    // Find the index of `startPage` within the ZIP's actual entry order
-    // (not the name-sorted imageEntries). We prefetch from the byte
-    // position of that entry forward.
-    const startEntry = this.imageEntries[startPage];
-    if (!startEntry) return;
-    const startEntryIdx = this.zip.entries.indexOf(startEntry);
-    if (startEntryIdx < 0) return;
-    // 8 MB is a good sweet spot: large enough to cover many pages,
-    // small enough to feel instant on a typical broadband connection.
-    this.zip.prefetchEntriesFrom(startEntryIdx, 8 * 1024 * 1024).catch(() => {});
-    // Also schedule a second-tier prefetch a moment later for pages
-    // further ahead. Done as a separate request so the first one comes
-    // back fast (HTTP/2 mux means they run in parallel anyway, but the
-    // browser prioritises smaller earlier requests).
-    setTimeout(() => {
-      if (this.cancelled) return;
-      this._prefetchAhead(startPage + 15, 8 * 1024 * 1024);
-    }, 500);
+    this._launchPrefetchAround(startPage, /*initial=*/true);
   }
 
   // Prefetch starting from a given page, with a target byte budget.
@@ -2862,7 +2886,156 @@ class Reader {
     if (!entry) return;
     const idx = this.zip.entries.indexOf(entry);
     if (idx < 0) return;
-    this.zip.prefetchEntriesFrom(idx, targetBytes).catch(() => {});
+    this.zip.prefetchEntriesFrom(idx, targetBytes, this._prefetchSignal()).catch(() => {});
+  }
+
+  // Returns the AbortSignal currently associated with prefetch requests.
+  // Replaced whenever the user jumps to a new region so old in-flight
+  // prefetches stop occupying Drive slots that the new region needs.
+  _prefetchSignal() {
+    if (!this._prefetchAbort) this._prefetchAbort = new AbortController();
+    return this._prefetchAbort.signal;
+  }
+
+  // Launch a fresh prefetch wave centred on `centerPage`. Cancels any
+  // in-flight prefetches that haven't completed yet so they release
+  // their Drive concurrency slots for the new region. Used both at
+  // initial open and on every user-initiated jump.
+  //
+  // Three tiers:
+  //   Tier 1 — immediate: 8 MB centred on the jump destination (with a
+  //            few pages of headroom backward for snappy back-paging).
+  //   Tier 2 — soon (~200-500 ms later): next 8 MB ahead.
+  //   Tier 3 — eventually (after Tier 1 lands): background fill covering
+  //            the entire ZIP at idle priority. So if the user paged
+  //            backward to a section we'd "abandoned", it's already in
+  //            memory. Skips chunks that the buffer already holds.
+  _launchPrefetchAround(centerPage, initial = false) {
+    if (!this.zip || !this.imageEntries.length) return;
+    // Abort any prior prefetch wave. readEntry calls (foreground page
+    // loads) have their own per-loadPage abort controllers, so this
+    // doesn't disturb the page the user is actively waiting for.
+    if (this._prefetchAbort) {
+      try { this._prefetchAbort.abort(); } catch {}
+    }
+    // Cancel any pending background-fill timer from a previous wave —
+    // a new wave restarts the fill from the new center.
+    if (this._bgFillTimer) {
+      cancelIdle(this._bgFillTimer);
+      this._bgFillTimer = null;
+    }
+    this._prefetchAbort = new AbortController();
+    const signal = this._prefetchAbort.signal;
+    this._prefetchCenter = centerPage;
+
+    // Tier 1: a fat prefetch covering the page the user is at PLUS
+    // the next ~10 pages worth of data. This is the "make the current
+    // view feel instant" wave.
+    const startEntry = this.imageEntries[centerPage];
+    if (!startEntry) return;
+    const startIdx = this.zip.entries.indexOf(startEntry);
+    if (startIdx < 0) return;
+    // Also prefetch ~3 pages worth BEFORE the current page so backwards
+    // navigation is snappy too. We pick the earliest of (centerPage-3,
+    // centerPage) and prefetch from there — the chunk covers both.
+    const backIdx = Math.max(0, centerPage - 3);
+    const backEntry = this.imageEntries[backIdx];
+    const realStartIdx = backEntry ? this.zip.entries.indexOf(backEntry) : startIdx;
+    const useStart = (realStartIdx >= 0 && realStartIdx <= startIdx) ? realStartIdx : startIdx;
+
+    const tier1 = this.zip.prefetchEntriesFrom(useStart, 8 * 1024 * 1024, signal).catch(() => {});
+
+    // Tier 2: pages further ahead. Done as a separate request so the
+    // first wave returns before the second tier starts saturating the
+    // gate. HTTP/2 mux still runs them in parallel, but the smaller
+    // request gets to return first.
+    setTimeout(() => {
+      if (this.cancelled || signal.aborted) return;
+      this._prefetchAhead(centerPage + 12, 8 * 1024 * 1024);
+    }, initial ? 500 : 200);
+
+    // Tier 3: kick off the background fill after Tier 1 has likely
+    // landed (1 second is enough for the first 8 MB on most networks).
+    // The fill walks outwards from centerPage, filling the ZIP at
+    // idle priority. Same abort signal so a fresh jump cancels it.
+    tier1.then(() => {
+      if (this.cancelled || signal.aborted) return;
+      this._scheduleBackgroundFill(centerPage, signal);
+    });
+  }
+
+  // Background fill: prefetches the rest of the ZIP in chunks, expanding
+  // outward from `centerPage`. Runs at idle priority and one chunk at a
+  // time so it doesn't compete with foreground page loads. Same abort
+  // signal as the parent prefetch wave — when the user jumps, the new
+  // _launchPrefetchAround call aborts this and starts fresh.
+  _scheduleBackgroundFill(centerPage, signal) {
+    if (!this.zip || !this.imageEntries.length) return;
+    const n = this.imageEntries.length;
+
+    // We walk outward from centerPage in chunk-sized steps. Each step
+    // prefetches ~6 MB starting at a particular entry. We use offset
+    // counters: nextForwardIdx and nextBackwardIdx, both initialised
+    // such that the first forward step picks up roughly where Tier 1
+    // left off, and the first backward step covers anything before.
+    const centerEntry = this.imageEntries[centerPage];
+    const centerEntryIdx = this.zip.entries.indexOf(centerEntry);
+    // Forward starts well past Tier 2's coverage; backward starts at 0.
+    let nextForwardPage = Math.min(n - 1, centerPage + 25);
+    let nextBackwardPage = 0;
+    let forwardDone = nextForwardPage >= n - 1;
+    let backwardDone = nextBackwardPage >= centerPage - 3;
+    let preferForward = true;  // alternate forward/backward to keep balance
+
+    const step = () => {
+      this._bgFillTimer = null;
+      if (this.cancelled || signal.aborted) return;
+      if (forwardDone && backwardDone) return;
+
+      // Pick a direction. Alternates so a back-paging user doesn't have
+      // to wait too long for backward fill to start.
+      let direction = preferForward ? 'forward' : 'backward';
+      if (direction === 'forward' && forwardDone) direction = 'backward';
+      else if (direction === 'backward' && backwardDone) direction = 'forward';
+      preferForward = !preferForward;
+
+      if (direction === 'forward') {
+        const page = nextForwardPage;
+        const entry = this.imageEntries[page];
+        const idx = entry ? this.zip.entries.indexOf(entry) : -1;
+        if (idx < 0) { forwardDone = true; this._bgFillTimer = scheduleIdle(step); return; }
+        // prefetchEntriesFrom returns the {start, end} actually planned,
+        // so we can advance our cursor to just past it. The promise
+        // itself dedupes against cached chunks.
+        Promise.resolve(this.zip.prefetchEntriesFrom(idx, 6 * 1024 * 1024, signal))
+          .then(() => {
+            // Estimate how many pages we just covered. We don't know
+            // exactly, but ~6 MB is roughly 15-25 pages of typical manga.
+            const advance = 15;
+            nextForwardPage += advance;
+            if (nextForwardPage >= n) forwardDone = true;
+            if (!this.cancelled && !signal.aborted) this._bgFillTimer = scheduleIdle(step);
+          })
+          .catch(() => { forwardDone = true; });
+      } else {
+        const page = nextBackwardPage;
+        const entry = this.imageEntries[page];
+        const idx = entry ? this.zip.entries.indexOf(entry) : -1;
+        if (idx < 0) { backwardDone = true; this._bgFillTimer = scheduleIdle(step); return; }
+        Promise.resolve(this.zip.prefetchEntriesFrom(idx, 6 * 1024 * 1024, signal))
+          .then(() => {
+            const advance = 15;
+            nextBackwardPage += advance;
+            // Once backward pointer catches up to (centerPage - 3), we
+            // overlap Tier 1; the buffer-pool dedup makes that cheap.
+            if (nextBackwardPage >= centerPage - 3) backwardDone = true;
+            if (!this.cancelled && !signal.aborted) this._bgFillTimer = scheduleIdle(step);
+          })
+          .catch(() => { backwardDone = true; });
+      }
+    };
+
+    this._bgFillTimer = scheduleIdle(step);
   }
 
   findSlotForPage(pageIdx) {
@@ -3064,6 +3237,10 @@ class Reader {
       const realPage = this._realPage(slot[0]);
       if (realPage !== null) {
         setProgress(this.file.id, realPage);
+        // Tell the ZIP buffer pool which bytes we're "near" so its
+        // eviction policy keeps the right chunks resident.
+        const entry = this.imageEntries[realPage];
+        if (entry && this.zip) this.zip.setCenterByteOffset(entry.lhOff);
         // Predictive prefetch: as the user advances, fire off the next
         // chunk of ZIP bytes ahead of where they'll need it. Cheap
         // because prefetchEntriesFrom dedupes already-cached ranges.
@@ -3602,7 +3779,14 @@ class Reader {
       const itemRect = currentEl.getBoundingClientRect();
       if (itemRect.left < stripRect.left || itemRect.right > stripRect.right) {
         const offset = currentEl.offsetLeft - strip.clientWidth / 2 + currentEl.clientWidth / 2;
-        strip.scrollTo({ left: offset, behavior: 'smooth' });
+        // For long jumps (more than 2x the visible width), skip the
+        // smooth-scroll animation. Smooth scrolling fires intersection
+        // events for every thumb the strip rolls past, which would
+        // pre-queue dozens of unwanted thumb fetches — wasting Drive
+        // slots that the user's actual destination needs.
+        const dx = Math.abs(offset - strip.scrollLeft);
+        const longJump = dx > strip.clientWidth * 2;
+        strip.scrollTo({ left: offset, behavior: longJump ? 'auto' : 'smooth' });
       }
     }
   }
@@ -3618,6 +3802,12 @@ class Reader {
     const slotIdx = this.findSlotForPage(p);
     if (slotIdx === this.currentSlotIndex) return;
     this.currentSlotIndex = slotIdx;
+    // Cancel any in-flight prefetch wave from the previous location and
+    // fire a new one centred on the jump destination. Without this,
+    // ZIP bytes for the OLD region keep streaming in and hogging the
+    // Drive concurrency slots that the new region's pages and thumbs
+    // need to load. Abortable so the gate frees up immediately.
+    this._launchPrefetchAround(p);
     this.scrollToSlot(slotIdx, false);
     this._settleSlot();
   }
@@ -3756,6 +3946,16 @@ class Reader {
     if (this._inflightAborts) {
       for (const ctl of this._inflightAborts.values()) ctl.abort();
       this._inflightAborts.clear();
+    }
+    // Abort the prefetch wave and cancel the background fill so they
+    // stop occupying Drive slots after the reader closes.
+    if (this._prefetchAbort) {
+      try { this._prefetchAbort.abort(); } catch {}
+      this._prefetchAbort = null;
+    }
+    if (this._bgFillTimer) {
+      cancelIdle(this._bgFillTimer);
+      this._bgFillTimer = null;
     }
     for (const url of this.bitmapCache.values()) URL.revokeObjectURL(url);
     this.bitmapCache.clear();
