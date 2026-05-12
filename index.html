@@ -414,11 +414,21 @@
   .thumb-item img {
     width: 100%; height: 100%; object-fit: cover;
     display: block;
+    /* Prevent the native image drag-and-drop operation from hijacking
+       pointer events on first mousedown. Without these, the browser
+       starts a "drag image to copy elsewhere" gesture which suspends
+       pointermove/pointerup, leaving our drag-state dangling. */
+    pointer-events: none;
+    -webkit-user-drag: none;
+    user-drag: none;
+    -webkit-user-select: none;
+    user-select: none;
   }
   .thumb-item .thumb-num {
     font-size: 11px;
     color: var(--text-dim);
     font-variant-numeric: tabular-nums;
+    pointer-events: none;  /* so mousedown lands on .thumb-item, not this label */
   }
   .thumb-item .thumb-label {
     position: absolute; left: 0; right: 0; bottom: 0;
@@ -427,6 +437,7 @@
     font-size: 10px; text-align: center;
     padding: 1px 0;
     font-variant-numeric: tabular-nums;
+    pointer-events: none;  /* same reason as .thumb-num above */
   }
   #page-jump-row {
     display: flex; align-items: center; justify-content: center;
@@ -3184,7 +3195,7 @@ class Reader {
     if (!item) return;
     if (item.querySelector('img')) return;  // already populated
     item.innerHTML =
-      `<img alt="" src="${thumbUrl}">` +
+      `<img alt="" draggable="false" src="${thumbUrl}">` +
       `<span class="thumb-label">${pageIndex + 1}</span>`;
   }
 
@@ -3846,9 +3857,21 @@ function wireReader() {
   if (strip) {
     let dragState = null;  // { startX, scrollLeftStart, moved, pointerId }
 
+    // Belt-and-suspenders: completely block any HTML5 drag-and-drop
+    // operation on the strip. The CSS user-drag rules + pointer-events
+    // on images should be enough, but this catches any edge case where
+    // a child element is somehow still draggable.
+    strip.addEventListener('dragstart', (e) => e.preventDefault());
+
     strip.addEventListener('pointerdown', (e) => {
       if (e.pointerType !== 'mouse') return;  // touch is already native
       if (e.button !== 0) return;             // ignore right/middle clicks
+      // Prevent the browser's native gestures (text selection,
+      // image drag-and-drop) from hijacking our pointer sequence.
+      // Without this, mousedown on an image inside .thumb-item starts
+      // a drag-copy operation that suspends pointermove/pointerup and
+      // leaves our dragState dangling.
+      e.preventDefault();
       dragState = {
         startX: e.clientX,
         scrollLeftStart: strip.scrollLeft,
@@ -3884,6 +3907,11 @@ function wireReader() {
     };
     strip.addEventListener('pointerup', endDrag);
     strip.addEventListener('pointercancel', endDrag);
+    // lostpointercapture is the catch-all that fires whenever pointer
+    // capture is lost for any reason — including when the OS or browser
+    // intercepts the pointer for its own purposes. This guarantees we
+    // never end up with a dangling dragState that follows the cursor.
+    strip.addEventListener('lostpointercapture', endDrag);
 
     // Wheel → horizontal. Mouse wheels emit deltaY; horizontal trackpads
     // emit deltaX directly. Pick the dominant axis so both work intuitively.
