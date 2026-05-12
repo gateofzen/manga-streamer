@@ -358,6 +358,102 @@
   #reader-overlay { pointer-events: none; }
   #reader-overlay > * { pointer-events: auto; }
 
+  /* ---------- Bottom overlay: thumbnail strip + page jump ---------- */
+  /* Pinned to the bottom of the reader. Slides in/out together with the
+     top overlay. The strip is horizontally scrollable; thumbnails use
+     row-reverse to match the RTL reading direction (page 1 sits at the
+     right edge, like other RTL manga readers). */
+  #reader-bottom-overlay {
+    position: absolute; left: 0; right: 0; bottom: 0;
+    padding: 8px 0 max(env(safe-area-inset-bottom, 0), 8px);
+    background: linear-gradient(to top, rgba(0,0,0,0.85), transparent);
+    display: flex; flex-direction: column; gap: 6px;
+    transition: opacity 0.25s, transform 0.25s;
+    z-index: 2;
+  }
+  #reader-bottom-overlay.hidden-overlay {
+    opacity: 0; transform: translateY(100%); pointer-events: none;
+  }
+  #thumb-strip {
+    display: flex; flex-direction: row-reverse;     /* RTL: page 1 on the right */
+    gap: 4px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 4px 12px;
+    scroll-behavior: smooth;
+    /* Hide scrollbar but keep functionality */
+    scrollbar-width: none;
+  }
+  #thumb-strip::-webkit-scrollbar { display: none; }
+  .thumb-item {
+    flex: 0 0 auto;
+    width: 56px; height: 80px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    overflow: hidden;
+    position: relative;
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    transition: border-color 0.15s, transform 0.15s;
+  }
+  .thumb-item.current {
+    border-color: var(--accent);
+    border-width: 2px;
+    /* Compensate for the extra border so size stays consistent */
+    width: 56px; height: 80px;
+  }
+  .thumb-item img {
+    width: 100%; height: 100%; object-fit: cover;
+    display: block;
+  }
+  .thumb-item .thumb-num {
+    font-size: 11px;
+    color: var(--text-dim);
+    font-variant-numeric: tabular-nums;
+  }
+  .thumb-item .thumb-label {
+    position: absolute; left: 0; right: 0; bottom: 0;
+    background: rgba(0,0,0,0.6);
+    color: #fff;
+    font-size: 10px; text-align: center;
+    padding: 1px 0;
+    font-variant-numeric: tabular-nums;
+  }
+  #page-jump-row {
+    display: flex; align-items: center; justify-content: center;
+    gap: 8px; padding: 0 12px;
+    font-size: 13px;
+  }
+  #page-jump-input {
+    width: 60px; padding: 4px 6px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text);
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+    font-size: 13px;
+  }
+  #page-jump-input::-webkit-outer-spin-button,
+  #page-jump-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+  #page-jump-input { -moz-appearance: textfield; }
+  #page-jump-row .total {
+    color: var(--text-dim);
+    font-variant-numeric: tabular-nums;
+  }
+  #page-jump-btn {
+    padding: 4px 12px;
+    background: var(--accent); color: #000;
+    border: none; border-radius: 4px;
+    font-size: 12px; font-weight: 600;
+    cursor: pointer;
+  }
+  #page-jump-btn:active { transform: scale(0.96); }
+
+  #reader-bottom-overlay { pointer-events: none; }
+  #reader-bottom-overlay > * { pointer-events: auto; }
+
   /* Toast */
   #toast {
     position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
@@ -467,6 +563,14 @@
     <div class="page-counter" id="page-counter">0 / 0</div>
   </div>
   <div id="reader-pages"></div>
+  <div id="reader-bottom-overlay" class="hidden-overlay">
+    <div id="thumb-strip"></div>
+    <div id="page-jump-row">
+      <input id="page-jump-input" type="number" min="1" inputmode="numeric" pattern="[0-9]*">
+      <span class="total" id="page-jump-total">/ 0</span>
+      <button id="page-jump-btn">移動</button>
+    </div>
+  </div>
 </div>
 
 <div id="toast"></div>
@@ -2320,10 +2424,15 @@ class Reader {
 
       console.log(tag, 'calling renderSlots');
       this.renderSlots();
+      // Build the thumbnail strip alongside the page DOM. Done synchronously
+      // because it's just placeholder DOM — image bitmaps populate as pages
+      // get loaded via the normal preload path.
+      this.buildThumbStrip();
       requestAnimationFrame(() => {
         if (this.cancelled) return;
         this.scrollToSlot(this.currentSlotIndex, false);
         this.updateCounter();
+        this.updateThumbStripCurrent();
         this.preload();
       });
 
@@ -2651,6 +2760,7 @@ class Reader {
     if (this.cancelled) return;
     console.log('[_settleSlot] currentSlotIndex=', this.currentSlotIndex);
     this.updateCounter();
+    this.updateThumbStripCurrent();
     this.preload();
     const slot = this.slots[this.currentSlotIndex];
     if (slot && slot[0] !== '__next__') {
@@ -2857,6 +2967,118 @@ class Reader {
         cell.innerHTML = `<img alt="" src="${url}">`;
       }
     }
+    // Also populate the matching thumbnail in the strip. We reuse the same
+    // blob URL — the strip just shows it at small size with object-fit:cover.
+    // No extra network or decode cost; the browser caches the decoded bitmap.
+    this.populateThumbnail(pageIndex, url);
+  }
+
+  // ---------------- Thumbnail strip + page jump ----------------
+  // Build the strip once per Reader.start. One thumb-item per real page;
+  // initially showing the page number, then upgrading to the actual image
+  // when that page gets loaded (via attachImage → populateThumbnail).
+  buildThumbStrip() {
+    const strip = $('thumb-strip');
+    if (!strip) return;
+    const n = this.imageEntries.length;
+    const total = $('page-jump-total');
+    if (total) total.textContent = `/ ${n}`;
+    const jumpInput = $('page-jump-input');
+    if (jumpInput) {
+      jumpInput.max = String(n);
+      jumpInput.value = '';
+      jumpInput.placeholder = '1';
+    }
+    // Generate every thumb item as a placeholder. Tapping a thumb jumps
+    // to that page; loading on demand happens via the normal preload path.
+    const html = [];
+    for (let i = 0; i < n; i++) {
+      const isCurrent = false; // updated by updateThumbStripCurrent shortly after
+      html.push(
+        `<div class="thumb-item${isCurrent ? ' current' : ''}" data-thumb-page="${i}">` +
+          `<span class="thumb-num">${i + 1}</span>` +
+        `</div>`
+      );
+    }
+    strip.innerHTML = html.join('');
+
+    // Wire click on each thumb. Use event delegation for efficiency on
+    // long volumes (hundreds of pages).
+    if (!strip._delegated) {
+      strip.addEventListener('click', (e) => {
+        const item = e.target.closest('.thumb-item');
+        if (!item || !state.reader) return;
+        const page = Number(item.dataset.thumbPage);
+        if (!isNaN(page)) state.reader.jumpToPage(page + 1);
+      });
+      strip._delegated = true;
+    }
+
+    // If any pages are already cached (e.g. user re-entered the reader),
+    // upgrade their thumbs immediately. Iterating the cache is cheap.
+    for (const [p, url] of this.bitmapCache) {
+      this.populateThumbnail(p, url);
+    }
+
+    this.updateThumbStripCurrent();
+  }
+
+  // Upgrade a thumb-item from placeholder to actual image. Called from
+  // attachImage when a page's blob URL becomes available.
+  populateThumbnail(pageIndex, url) {
+    const strip = $('thumb-strip');
+    if (!strip) return;
+    const item = strip.querySelector(`.thumb-item[data-thumb-page="${pageIndex}"]`);
+    if (!item) return;
+    if (item.querySelector('img')) return;  // already populated
+    // Keep the page number as a small overlay label so the user can still
+    // see which page each thumb is.
+    item.innerHTML =
+      `<img alt="" src="${url}">` +
+      `<span class="thumb-label">${pageIndex + 1}</span>`;
+  }
+
+  // Highlight the thumb for the current slot and scroll it into view so
+  // the user can always see where they are without manual scrolling.
+  updateThumbStripCurrent() {
+    const strip = $('thumb-strip');
+    if (!strip) return;
+    const slot = this.slots[this.currentSlotIndex];
+    if (!slot || slot[0] === '__next__') return;
+    const currentPage = this._realPage(slot[0]);
+    if (currentPage == null) return;
+    let currentEl = null;
+    for (const el of strip.querySelectorAll('.thumb-item')) {
+      const isCur = Number(el.dataset.thumbPage) === currentPage;
+      el.classList.toggle('current', isCur);
+      if (isCur) currentEl = el;
+    }
+    // Center the current thumb in the strip if it's not already in view.
+    // Only do this when the bottom overlay is visible — otherwise we waste
+    // work and might fight with user scroll while the strip is hidden.
+    if (currentEl && !$('reader-bottom-overlay').classList.contains('hidden-overlay')) {
+      const stripRect = strip.getBoundingClientRect();
+      const itemRect = currentEl.getBoundingClientRect();
+      if (itemRect.left < stripRect.left || itemRect.right > stripRect.right) {
+        const offset = currentEl.offsetLeft - strip.clientWidth / 2 + currentEl.clientWidth / 2;
+        strip.scrollTo({ left: offset, behavior: 'smooth' });
+      }
+    }
+  }
+
+  // Jump to the slot containing the given 1-based page number. Clamps to
+  // valid range. Used by both the thumb strip and the page-jump input.
+  jumpToPage(pageNumber1) {
+    const n = this.imageEntries.length;
+    let p = parseInt(pageNumber1, 10) - 1;
+    if (isNaN(p)) return;
+    if (p < 0) p = 0;
+    if (p >= n) p = n - 1;
+    const slotIdx = this.findSlotForPage(p);
+    if (slotIdx === this.currentSlotIndex) return;
+    this.currentSlotIndex = slotIdx;
+    this.scrollToSlot(slotIdx, false);
+    this._settleSlot();
   }
 
   // Returns a Set of page indices that should NOT be evicted from cache —
@@ -2998,6 +3220,11 @@ class Reader {
     this.bitmapCache.clear();
     this.loading.clear();
     if (this._loadQueue) this._loadQueue.length = 0;
+    // Clear the strip so the next reader doesn't briefly flash stale thumbs.
+    const strip = $('thumb-strip');
+    if (strip) strip.innerHTML = '';
+    // Ensure both overlays are hidden for the new reader so we start clean.
+    $('reader-bottom-overlay').classList.add('hidden-overlay');
   }
 }
 
@@ -3231,6 +3458,26 @@ function wireReader() {
   $('fullscreen-btn').addEventListener('click', toggleFullscreen);
   updateFullscreenIcon();
 
+  // Page-jump: number input + button. Pressing Enter inside the input
+  // triggers the same jump. We don't auto-jump on every keystroke because
+  // the user is often typing a multi-digit number ("123") and we'd otherwise
+  // navigate to page 1, then 12, then 123 mid-typing.
+  const jumpInput = $('page-jump-input');
+  const doJump = () => {
+    if (!state.reader) return;
+    const v = jumpInput.value.trim();
+    if (!v) return;
+    state.reader.jumpToPage(v);
+    jumpInput.blur();  // dismiss mobile keyboard
+  };
+  $('page-jump-btn').addEventListener('click', doJump);
+  jumpInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      doJump();
+    }
+  });
+
   // Tap zones: use the coordinate of the click on #reader-pages itself, so
   // we don't need overlay elements that block native swipe-to-scroll.
   // Left third → next (RTL advance), middle → toggle overlay, right third → prev.
@@ -3248,7 +3495,16 @@ function wireReader() {
     const xRatio = (e.clientX - rect.left) / rect.width;
     if (xRatio < 1/3)       state.reader.next();
     else if (xRatio > 2/3)  state.reader.prev();
-    else                    $('reader-overlay').classList.toggle('hidden-overlay');
+    else {
+      // Middle tap toggles BOTH overlays together so the thumbnail strip
+      // and page-jump appear at the same time as the title bar.
+      $('reader-overlay').classList.toggle('hidden-overlay');
+      $('reader-bottom-overlay').classList.toggle('hidden-overlay');
+      // When opening, scroll the strip to center on the current page.
+      if (!$('reader-bottom-overlay').classList.contains('hidden-overlay')) {
+        state.reader.updateThumbStripCurrent();
+      }
+    }
   });
 
   document.addEventListener('keydown', (e) => {
@@ -3267,6 +3523,14 @@ function wireReader() {
     else if (e.key === 'v' || e.key === 'V') { if (state.reader) state.reader.toggleViewMode(); }
     else if (e.key === 'p' || e.key === 'P') { if (state.reader) state.reader.togglePairOffset(); }
     else if (e.key === 'f' || e.key === 'F') toggleFullscreen();
+    else if (e.key === 'g' || e.key === 'G') {
+      // Open the bottom overlay (if hidden) and focus the page-jump input
+      $('reader-overlay').classList.remove('hidden-overlay');
+      $('reader-bottom-overlay').classList.remove('hidden-overlay');
+      const inp = $('page-jump-input');
+      if (inp) { inp.focus(); inp.select(); }
+      if (state.reader) state.reader.updateThumbStripCurrent();
+    }
     else handled = false;
 
     // Prevent the browser's native scrolling behavior for keys we handle
