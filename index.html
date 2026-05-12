@@ -962,23 +962,39 @@ let _tokenRefreshPromise = null;
 // per-user rate limiter on a slow connection.
 const DRIVE_MAX_INFLIGHT = 8;
 let _driveActiveCount = 0;
-const _driveWaitQueue = [];
+// Priority queue: foreground page loads (priority 0) jump the line ahead
+// of thumbnails (priority 1), prefetch waves (priority 2), and background
+// fill (priority 3). Each queue level is FIFO within itself. This means
+// the page the user is staring at always gets bandwidth first, even when
+// dozens of background fetches are pending.
+const DRIVE_PRIORITY_LEVELS = 4;
+const _driveWaitQueues = Array.from({ length: DRIVE_PRIORITY_LEVELS }, () => []);
 
-function _driveAcquire() {
+function _driveAcquire(priority = 1) {
   return new Promise(resolve => {
     if (_driveActiveCount < DRIVE_MAX_INFLIGHT) {
       _driveActiveCount++;
       resolve();
     } else {
-      _driveWaitQueue.push(resolve);
+      const p = Math.max(0, Math.min(DRIVE_PRIORITY_LEVELS - 1, priority | 0));
+      _driveWaitQueues[p].push(resolve);
     }
   });
 }
 
 function _driveRelease() {
   _driveActiveCount--;
-  const next = _driveWaitQueue.shift();
-  if (next) { _driveActiveCount++; next(); }
+  // Scan queues from highest priority (0) down — pick the first one
+  // with a waiter.
+  for (let p = 0; p < DRIVE_PRIORITY_LEVELS; p++) {
+    const q = _driveWaitQueues[p];
+    if (q.length > 0) {
+      const next = q.shift();
+      _driveActiveCount++;
+      next();
+      return;
+    }
+  }
 }
 
 function ensureToken() {
@@ -1037,7 +1053,7 @@ function signOut() {
 async function driveFetch(url, init = {}) {
   const tag = '[driveFetch ' + Math.random().toString(36).substring(2, 7) + ']';
   console.log(tag, 'enter', url.substring(0, 80));
-  await _driveAcquire();
+  await _driveAcquire(init.priority);
   try {
     return await _driveFetchInner(url, init, tag);
   } finally {
@@ -1223,7 +1239,7 @@ async function getFileSize(fileId) {
   return parseInt(data.size, 10);
 }
 
-async function fetchRange(fileId, start, end, signal = null) {
+async function fetchRange(fileId, start, end, signal = null, priority = 1) {
   const tag = `[fetchRange ${start}-${end}]`;
   const t0 = Date.now();
   console.log(tag, 'enter');
@@ -1247,6 +1263,7 @@ async function fetchRange(fileId, start, end, signal = null) {
     const resp = await driveFetch(url, {
       headers: { 'Range': `bytes=${start}-${end}` },
       signal,
+      priority,
     });
     if (!resp.ok && resp.status !== 206) {
       if (resp._timeoutCleanup) resp._timeoutCleanup();
@@ -1590,7 +1607,7 @@ class ZipReader {
   // Fetch a chunk of the ZIP and stash it for later reads. Coalesces
   // duplicate concurrent calls for the same start offset so callers
   // can liberally request prefetches without worry.
-  async prefetchChunk(start, end, signal = null) {
+  async prefetchChunk(start, end, signal = null, priority = 2) {
     end = Math.min(end, this.fileSize - 1);
     if (end < start) return null;
     // Skip if already covered (fast path)
@@ -1599,7 +1616,7 @@ class ZipReader {
     if (this._chunkInflight.has(key)) return this._chunkInflight.get(key);
     const p = (async () => {
       try {
-        const bytes = await fetchRange(this.fileId, start, end, signal);
+        const bytes = await fetchRange(this.fileId, start, end, signal, priority);
         if (signal && signal.aborted) return null;
         this._addChunk(start, bytes);
         return bytes;
@@ -1615,7 +1632,7 @@ class ZipReader {
   // entry index `startIdx`. Returns the {start, end} that was requested
   // (callers can await the returned promise to know when it's ready).
   // Skipped if the chunk would be empty or already cached.
-  async prefetchEntriesFrom(startIdx, targetBytes = 6 * 1024 * 1024, signal = null) {
+  async prefetchEntriesFrom(startIdx, targetBytes = 6 * 1024 * 1024, signal = null, priority = 2) {
     if (!this.entries || startIdx >= this.entries.length) return null;
     // Find the byte range that covers as many sequential entries as
     // possible, up to targetBytes total compressed bytes. We assume
@@ -1640,7 +1657,7 @@ class ZipReader {
       this.fileSize - 1
     );
     if (end - start < 1024) return null;  // not worth a request
-    await this.prefetchChunk(start, end, signal);
+    await this.prefetchChunk(start, end, signal, priority);
     return { start, end };
   }
 
@@ -1733,7 +1750,7 @@ class ZipReader {
     return entries;
   }
 
-  async readEntry(entry, signal = null) {
+  async readEntry(entry, signal = null, priority = 1) {
     if (entry.encrypted) throw new Error('Encrypted ZIP entries are not supported');
 
     // Speculative single-range fetch: assume name+extra ≤ 256 bytes, get
@@ -1748,7 +1765,7 @@ class ZipReader {
     // reads.
     let buf = this._lookupChunk(entry.lhOff, fetchEnd);
     if (!buf) {
-      buf = await fetchRange(this.fileId, entry.lhOff, fetchEnd, signal);
+      buf = await fetchRange(this.fileId, entry.lhOff, fetchEnd, signal, priority);
       // Stash the speculative-read bytes too — they often satisfy the
       // NEXT entry's local header by coincidence.
       this._addChunk(entry.lhOff, buf);
@@ -1771,7 +1788,7 @@ class ZipReader {
       if (cached) {
         compBytes = cached;
       } else {
-        compBytes = await fetchRange(this.fileId, dataStart, dataEnd, signal);
+        compBytes = await fetchRange(this.fileId, dataStart, dataEnd, signal, priority);
       }
     }
 
@@ -2912,56 +2929,55 @@ class Reader {
   //            memory. Skips chunks that the buffer already holds.
   _launchPrefetchAround(centerPage, initial = false) {
     if (!this.zip || !this.imageEntries.length) return;
-    // Abort any prior prefetch wave. readEntry calls (foreground page
-    // loads) have their own per-loadPage abort controllers, so this
-    // doesn't disturb the page the user is actively waiting for.
+    // Abort prior wave + cancel pending fill + clear any pending start timer.
     if (this._prefetchAbort) {
       try { this._prefetchAbort.abort(); } catch {}
     }
-    // Cancel any pending background-fill timer from a previous wave —
-    // a new wave restarts the fill from the new center.
     if (this._bgFillTimer) {
       cancelIdle(this._bgFillTimer);
       this._bgFillTimer = null;
+    }
+    if (this._prefetchStartTimer) {
+      clearTimeout(this._prefetchStartTimer);
+      this._prefetchStartTimer = null;
     }
     this._prefetchAbort = new AbortController();
     const signal = this._prefetchAbort.signal;
     this._prefetchCenter = centerPage;
 
-    // Tier 1: a fat prefetch covering the page the user is at PLUS
-    // the next ~10 pages worth of data. This is the "make the current
-    // view feel instant" wave.
-    const startEntry = this.imageEntries[centerPage];
+    // KEY INSIGHT: priorities solve most of the bandwidth contention by
+    // making foreground reads jump ahead of prefetch in the Drive queue.
+    // But we ALSO add a small delay before starting the prefetch so the
+    // foreground reads can grab their slots first, then bandwidth stays
+    // mostly with them while their bytes are arriving. The prefetch then
+    // fills in over the following second or two.
+    //
+    // Tier 1 starts at centerPage+5 — past the foreground preload window
+    // (which covers centerPage, +1..+4 and centerPage-1). No redundant
+    // bytes downloaded.
+    const startPage = Math.min(this.imageEntries.length - 1, centerPage + 5);
+    const startEntry = this.imageEntries[startPage];
     if (!startEntry) return;
     const startIdx = this.zip.entries.indexOf(startEntry);
     if (startIdx < 0) return;
-    // Also prefetch ~3 pages worth BEFORE the current page so backwards
-    // navigation is snappy too. We pick the earliest of (centerPage-3,
-    // centerPage) and prefetch from there — the chunk covers both.
-    const backIdx = Math.max(0, centerPage - 3);
-    const backEntry = this.imageEntries[backIdx];
-    const realStartIdx = backEntry ? this.zip.entries.indexOf(backEntry) : startIdx;
-    const useStart = (realStartIdx >= 0 && realStartIdx <= startIdx) ? realStartIdx : startIdx;
 
-    const tier1 = this.zip.prefetchEntriesFrom(useStart, 8 * 1024 * 1024, signal).catch(() => {});
-
-    // Tier 2: pages further ahead. Done as a separate request so the
-    // first wave returns before the second tier starts saturating the
-    // gate. HTTP/2 mux still runs them in parallel, but the smaller
-    // request gets to return first.
-    setTimeout(() => {
+    const delay = initial ? 600 : 400;
+    this._prefetchStartTimer = setTimeout(() => {
+      this._prefetchStartTimer = null;
       if (this.cancelled || signal.aborted) return;
-      this._prefetchAhead(centerPage + 12, 8 * 1024 * 1024);
-    }, initial ? 500 : 200);
 
-    // Tier 3: kick off the background fill after Tier 1 has likely
-    // landed (1 second is enough for the first 8 MB on most networks).
-    // The fill walks outwards from centerPage, filling the ZIP at
-    // idle priority. Same abort signal so a fresh jump cancels it.
-    tier1.then(() => {
-      if (this.cancelled || signal.aborted) return;
-      this._scheduleBackgroundFill(centerPage, signal);
-    });
+      // Prefetch a fat chunk (8 MB) of compressed pages at priority 2.
+      // Background fill (priority 3) starts after this lands so the wave
+      // and the fill don't fight each other.
+      const tier1 = this.zip.prefetchEntriesFrom(
+        startIdx, 8 * 1024 * 1024, signal, 2
+      ).catch(() => {});
+
+      tier1.then(() => {
+        if (this.cancelled || signal.aborted) return;
+        this._scheduleBackgroundFill(centerPage, signal);
+      });
+    }, delay);
   }
 
   // Background fill: prefetches the rest of the ZIP in chunks, expanding
@@ -3006,8 +3022,9 @@ class Reader {
         if (idx < 0) { forwardDone = true; this._bgFillTimer = scheduleIdle(step); return; }
         // prefetchEntriesFrom returns the {start, end} actually planned,
         // so we can advance our cursor to just past it. The promise
-        // itself dedupes against cached chunks.
-        Promise.resolve(this.zip.prefetchEntriesFrom(idx, 6 * 1024 * 1024, signal))
+        // itself dedupes against cached chunks. Priority 3 = background
+        // fill: yields to everything else.
+        Promise.resolve(this.zip.prefetchEntriesFrom(idx, 6 * 1024 * 1024, signal, 3))
           .then(() => {
             // Estimate how many pages we just covered. We don't know
             // exactly, but ~6 MB is roughly 15-25 pages of typical manga.
@@ -3022,7 +3039,7 @@ class Reader {
         const entry = this.imageEntries[page];
         const idx = entry ? this.zip.entries.indexOf(entry) : -1;
         if (idx < 0) { backwardDone = true; this._bgFillTimer = scheduleIdle(step); return; }
-        Promise.resolve(this.zip.prefetchEntriesFrom(idx, 6 * 1024 * 1024, signal))
+        Promise.resolve(this.zip.prefetchEntriesFrom(idx, 6 * 1024 * 1024, signal, 3))
           .then(() => {
             const advance = 15;
             nextBackwardPage += advance;
@@ -3241,12 +3258,6 @@ class Reader {
         // eviction policy keeps the right chunks resident.
         const entry = this.imageEntries[realPage];
         if (entry && this.zip) this.zip.setCenterByteOffset(entry.lhOff);
-        // Predictive prefetch: as the user advances, fire off the next
-        // chunk of ZIP bytes ahead of where they'll need it. Cheap
-        // because prefetchEntriesFrom dedupes already-cached ranges.
-        // We aim ~10 pages ahead, leaving plenty of headroom even at
-        // fast page-turn speeds.
-        this._prefetchAhead(realPage + 10, 6 * 1024 * 1024);
       }
     }
   }
@@ -3370,7 +3381,9 @@ class Reader {
         let bytes;
         try {
           console.log(`[loadPage ${pageIndex}] readEntry attempt 1`);
-          bytes = await this.zip.readEntry(entry, ctl.signal);
+          // Priority 0 = foreground reader page. Always jumps the line
+          // ahead of thumbnail/prefetch/background-fill work.
+          bytes = await this.zip.readEntry(entry, ctl.signal, 0);
           console.log(`[loadPage ${pageIndex}] readEntry success, ${bytes.length} bytes, ${Date.now()-startTime}ms`);
         } catch (err1) {
           if (isAborted()) {
@@ -3382,7 +3395,7 @@ class Reader {
           await new Promise(r => setTimeout(r, 400));
           if (this.cancelled || isAborted()) return;
           console.log(`[loadPage ${pageIndex}] readEntry attempt 2`);
-          bytes = await this.zip.readEntry(entry, ctl.signal);
+          bytes = await this.zip.readEntry(entry, ctl.signal, 0);
           console.log(`[loadPage ${pageIndex}] readEntry retry success`);
         }
         if (this.cancelled || isAborted()) return;
@@ -3647,7 +3660,9 @@ class Reader {
       try {
         const entry = this.imageEntries[pageIndex];
         if (!entry) return;
-        const bytes = await this.zip.readEntry(entry, ctl.signal);
+        // Priority 1 = thumbnail. Yields to foreground page loads but
+        // beats prefetch waves and background fill.
+        const bytes = await this.zip.readEntry(entry, ctl.signal, 1);
         if (this.cancelled || ctl.signal.aborted) return;
         const ext = entry.name.split('.').pop().toLowerCase();
         const mime = ext === 'png' ? 'image/png'
@@ -3956,6 +3971,10 @@ class Reader {
     if (this._bgFillTimer) {
       cancelIdle(this._bgFillTimer);
       this._bgFillTimer = null;
+    }
+    if (this._prefetchStartTimer) {
+      clearTimeout(this._prefetchStartTimer);
+      this._prefetchStartTimer = null;
     }
     for (const url of this.bitmapCache.values()) URL.revokeObjectURL(url);
     this.bitmapCache.clear();
