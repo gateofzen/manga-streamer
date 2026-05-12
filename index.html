@@ -3617,14 +3617,29 @@ function wireSignIn() {
   const saved = localStorage.getItem(STORAGE_CLIENT_ID);
   if (saved) input.value = saved;
 
+  // Lenient validation: enable the button as long as the value looks
+  // plausibly like a Client ID. We accept either:
+  //  - a full Google client ID (contains '.apps.googleusercontent.com')
+  //  - any reasonably long string with a dot or dash in it — covers
+  //    case where the user only pasted the short form, or where
+  //    Google's domain naming changed. The actual sign-in call will
+  //    fail loudly if the ID is wrong, which is recoverable.
   const validate = () => {
-    btn.disabled = !input.value.trim().includes('.apps.googleusercontent.com');
+    const v = input.value.trim();
+    const looksValid = v.length >= 10 && /[.\-_]/.test(v);
+    btn.disabled = !looksValid;
   };
   input.addEventListener('input', validate);
+  // Also fire on change/paste/blur in case the input event misses something
+  // (e.g. autofill on some browsers doesn't fire 'input')
+  input.addEventListener('change', validate);
+  input.addEventListener('blur', validate);
+  input.addEventListener('paste', () => setTimeout(validate, 0));
   validate();
 
   btn.addEventListener('click', () => {
     const v = input.value.trim();
+    if (!v) return;
     state.clientId = v;
     localStorage.setItem(STORAGE_CLIENT_ID, v);
     requestSignIn(true);  // explicit user action → fall back to consent prompt
@@ -3818,72 +3833,64 @@ function wireReader() {
   });
 
   // ---------------- Desktop mouse interaction for the thumb strip ----------------
-  // Touch devices have native swipe-to-scroll, but desktop browsers need:
-  // (1) click-and-drag to pan the strip horizontally, like Google Maps
-  // (2) mouse wheel mapped to horizontal scrolling (since the strip is
-  //     horizontal but mouse wheels deliver deltaY by default).
+  // Click-and-drag pan + mouse wheel → horizontal scroll. We use Pointer
+  // Events with setPointerCapture rather than window-level mouse listeners
+  // — that way the listeners are strictly scoped to the strip element and
+  // cannot interfere with sign-in, navigation, or any other UI even if
+  // our drag state machine has a bug. Pointer capture also handles the
+  // "mouse left the strip rect mid-drag" case automatically.
+  //
+  // Touch devices already have native swipe-to-scroll on overflow:auto,
+  // so we filter to pointerType === 'mouse' to avoid double-handling.
   const strip = $('thumb-strip');
   if (strip) {
-    let dragState = null;  // { startX, scrollLeftStart, moved }
+    let dragState = null;  // { startX, scrollLeftStart, moved, pointerId }
 
-    strip.addEventListener('mousedown', (e) => {
-      // Ignore right-click and modifier-click so they don't intercept
-      // context-menu and ctrl-click for other purposes.
-      if (e.button !== 0) return;
+    strip.addEventListener('pointerdown', (e) => {
+      if (e.pointerType !== 'mouse') return;  // touch is already native
+      if (e.button !== 0) return;             // ignore right/middle clicks
       dragState = {
         startX: e.clientX,
         scrollLeftStart: strip.scrollLeft,
         moved: false,
+        pointerId: e.pointerId,
       };
       strip.classList.add('dragging');
-      // Don't prevent default on mousedown — that would block the
-      // subsequent 'click' on a thumb-item (jump-to-page). We only
-      // suppress click after a real drag occurred.
+      try { strip.setPointerCapture(e.pointerId); } catch {}
     });
 
-    // Window-level move/up so a drag that escapes the strip rect still
-    // works (user moves cursor outside the strip mid-drag).
-    window.addEventListener('mousemove', (e) => {
-      if (!dragState) return;
+    strip.addEventListener('pointermove', (e) => {
+      if (!dragState || e.pointerId !== dragState.pointerId) return;
       const dx = e.clientX - dragState.startX;
       if (Math.abs(dx) > 3) dragState.moved = true;
-      // Drag direction: dragging the strip to the RIGHT (positive dx)
-      // should reveal content from the LEFT. That means scrollLeft
-      // decreases. Hence the minus sign.
       strip.scrollLeft = dragState.scrollLeftStart - dx;
     });
 
-    window.addEventListener('mouseup', (e) => {
-      if (!dragState) return;
+    const endDrag = (e) => {
+      if (!dragState || e.pointerId !== dragState.pointerId) return;
       const wasDrag = dragState.moved;
       strip.classList.remove('dragging');
+      try { strip.releasePointerCapture(dragState.pointerId); } catch {}
       dragState = null;
-      // If the user actually dragged (not just clicked), suppress the
-      // upcoming 'click' so we don't accidentally jump to a page after
-      // pulling on the strip.
+      // If the user actually dragged, eat the upcoming click on the
+      // strip so we don't accidentally jump pages. Scoped to the strip
+      // with once+capture so it cannot leak to other parts of the page.
       if (wasDrag) {
-        const suppress = (ev) => {
+        strip.addEventListener('click', (ev) => {
           ev.stopPropagation();
           ev.preventDefault();
-          window.removeEventListener('click', suppress, true);
-        };
-        window.addEventListener('click', suppress, true);
+        }, { once: true, capture: true });
       }
-    });
+    };
+    strip.addEventListener('pointerup', endDrag);
+    strip.addEventListener('pointercancel', endDrag);
 
-    // Wheel → horizontal. We translate vertical scroll to horizontal so
-    // a normal mouse wheel (no shift, no horizontal trackpad gesture)
-    // navigates the strip naturally. Trackpads that already provide
-    // deltaX get passed through unchanged.
+    // Wheel → horizontal. Mouse wheels emit deltaY; horizontal trackpads
+    // emit deltaX directly. Pick the dominant axis so both work intuitively.
     strip.addEventListener('wheel', (e) => {
-      // If the user is also pressing the shift key, browsers already
-      // translate deltaY to deltaX — let the native behavior happen.
-      // Same goes for any user gesture that already has deltaX.
       const dx = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
       if (dx === 0) return;
       e.preventDefault();
-      // 'auto' (not smooth) so the strip tracks the wheel exactly, like
-      // scrolling a row of items in any other UI.
       strip.scrollBy({ left: dx, behavior: 'auto' });
     }, { passive: false });
   }
