@@ -1623,15 +1623,24 @@ class ZipReader {
 // Thumbnail cache (IndexedDB) + on-demand fetcher
 //===========================================================================
 const THUMB_DB_NAME = 'mangaStreamer.thumbs';
-const THUMB_STORE = 'covers';
+const THUMB_STORE = 'covers';          // per-file cover (book listing)
+const PAGE_THUMB_STORE = 'pageThumbs'; // per-page small thumbnail keyed "fileId:pageIdx"
 let thumbDbPromise = null;
 
 function openThumbDb() {
   if (thumbDbPromise) return thumbDbPromise;
   thumbDbPromise = new Promise((resolve, reject) => {
-    const req = indexedDB.open(THUMB_DB_NAME, 1);
-    req.onupgradeneeded = () => {
-      req.result.createObjectStore(THUMB_STORE);
+    // Version 2 adds the pageThumbs store; old browsers running v1 will
+    // upgrade transparently and existing cover thumbs are preserved.
+    const req = indexedDB.open(THUMB_DB_NAME, 2);
+    req.onupgradeneeded = (e) => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(THUMB_STORE)) {
+        db.createObjectStore(THUMB_STORE);
+      }
+      if (!db.objectStoreNames.contains(PAGE_THUMB_STORE)) {
+        db.createObjectStore(PAGE_THUMB_STORE);
+      }
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -1661,6 +1670,99 @@ async function putCachedThumb(fileId, blob) {
       tx.onerror = () => reject(tx.error);
     });
   } catch {}
+}
+
+// ---------- Page thumbnails (per-page mini covers for the strip) ----------
+// Stored keyed by `${fileId}:${pageIdx}` as small JPEG blobs (~5-10 KB each).
+// 200-page volume → ~1-2 MB total in IndexedDB. Read-once, render forever.
+function pageThumbKey(fileId, pageIdx) {
+  return `${fileId}:${pageIdx}`;
+}
+
+async function getCachedPageThumb(fileId, pageIdx) {
+  try {
+    const db = await openThumbDb();
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(PAGE_THUMB_STORE, 'readonly');
+      const req = tx.objectStore(PAGE_THUMB_STORE).get(pageThumbKey(fileId, pageIdx));
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+  } catch { return null; }
+}
+
+async function putCachedPageThumb(fileId, pageIdx, blob) {
+  try {
+    const db = await openThumbDb();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(PAGE_THUMB_STORE, 'readwrite');
+      tx.objectStore(PAGE_THUMB_STORE).put(blob, pageThumbKey(fileId, pageIdx));
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch {}
+}
+
+// Reduce a full-resolution image (as a blob URL or Blob) to a small JPEG
+// blob suitable for the strip — ~112×160 logical, 1.5x dpr for retina.
+// Aspect ratio is preserved; the canvas size matches the scaled image so
+// the small blob is as small as possible (no padded transparent margins).
+async function makeThumbBlob(srcBlob) {
+  const maxW = 168;   // 112 * 1.5x dpr — looks crisp on phones too
+  const maxH = 240;   // 160 * 1.5x dpr
+  const url = URL.createObjectURL(srcBlob);
+  try {
+    // ImageBitmap is faster and yields better downscaling than <img>;
+    // available on all modern browsers. Falls back to <img> if not.
+    let bitmap;
+    if (typeof createImageBitmap === 'function') {
+      try {
+        bitmap = await createImageBitmap(srcBlob, {
+          resizeWidth: maxW,
+          resizeQuality: 'medium',
+        });
+      } catch {
+        // Some browsers reject resizeWidth options for certain formats — fall through
+        bitmap = null;
+      }
+    }
+    let w, h, drawSrc;
+    if (bitmap) {
+      w = bitmap.width;
+      h = bitmap.height;
+      drawSrc = bitmap;
+    } else {
+      // Fallback: <img> element
+      const img = await new Promise((resolve, reject) => {
+        const im = new Image();
+        im.onload = () => resolve(im);
+        im.onerror = reject;
+        im.src = url;
+      });
+      const ratio = Math.min(maxW / img.naturalWidth, maxH / img.naturalHeight, 1);
+      w = Math.round(img.naturalWidth * ratio);
+      h = Math.round(img.naturalHeight * ratio);
+      drawSrc = img;
+    }
+    // If createImageBitmap honoured resizeWidth, height is already proportional.
+    // If not (fallback), w and h are computed manually. Either way clamp h to maxH.
+    if (h > maxH) {
+      const scale = maxH / h;
+      h = maxH;
+      w = Math.round(w * scale);
+    }
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(drawSrc, 0, 0, w, h);
+    if (bitmap && bitmap.close) bitmap.close();
+    return await new Promise(resolve =>
+      canvas.toBlob(resolve, 'image/jpeg', 0.72)
+    );
+  } finally {
+    URL.revokeObjectURL(url);
+  }
 }
 
 // Fetch only the cover (first image entry) of a ZIP without reading the
@@ -2982,6 +3084,14 @@ class Reader {
   // Build the strip once per Reader.start. One thumb-item per real page;
   // initially showing the page number, then upgrading to the actual image
   // when that page gets loaded (via attachImage → populateThumbnail).
+  // ---------------- Thumbnail strip + page jump ----------------
+  // Strategy: every page gets its own miniature (~5-10 KB JPEG) stored in
+  // IndexedDB. Three sources, tried in order:
+  //   1. Memory cache (this._pageThumbBlobs)
+  //   2. IndexedDB cache (getCachedPageThumb)
+  //   3. Fetch from ZIP, downscale via Canvas, save to both caches
+  // Visible thumbs (intersecting the viewport) are fetched first; the
+  // remaining tail drains in the background while the reader is idle.
   buildThumbStrip() {
     const strip = $('thumb-strip');
     if (!strip) return;
@@ -2994,21 +3104,27 @@ class Reader {
       jumpInput.value = '';
       jumpInput.placeholder = '1';
     }
-    // Generate every thumb item as a placeholder. Tapping a thumb jumps
-    // to that page; loading on demand happens via the normal preload path.
+
+    // Per-reader thumbnail state
+    this._pageThumbBlobs = new Map();        // pageIdx -> object URL
+    this._thumbInflight = new Map();         // pageIdx -> Promise
+    this._thumbAborts = new Map();           // pageIdx -> AbortController
+    this._thumbVisible = new Set();          // pageIdx currently in strip viewport
+    this._thumbDrainTimer = null;            // idle drain timer
+
+    // Generate placeholder DOM
     const html = [];
     for (let i = 0; i < n; i++) {
-      const isCurrent = false; // updated by updateThumbStripCurrent shortly after
       html.push(
-        `<div class="thumb-item${isCurrent ? ' current' : ''}" data-thumb-page="${i}">` +
+        `<div class="thumb-item" data-thumb-page="${i}">` +
           `<span class="thumb-num">${i + 1}</span>` +
         `</div>`
       );
     }
     strip.innerHTML = html.join('');
 
-    // Wire click on each thumb. Use event delegation for efficiency on
-    // long volumes (hundreds of pages).
+    // Wire click handler once. Use event delegation so we don't add N
+    // listeners on a 200-page volume.
     if (!strip._delegated) {
       strip.addEventListener('click', (e) => {
         const item = e.target.closest('.thumb-item');
@@ -3019,28 +3135,225 @@ class Reader {
       strip._delegated = true;
     }
 
-    // If any pages are already cached (e.g. user re-entered the reader),
-    // upgrade their thumbs immediately. Iterating the cache is cheap.
+    // Disconnect any previous observer (from an earlier Reader instance)
+    if (this._thumbObserver) this._thumbObserver.disconnect();
+    // IntersectionObserver gives us high-priority loading for thumbs the
+    // user is actually looking at. We use rootMargin to start fetching
+    // slightly before the thumb scrolls into view, so visible scrolling
+    // feels instant rather than chasing the user.
+    this._thumbObserver = new IntersectionObserver((entries) => {
+      for (const e of entries) {
+        const page = Number(e.target.dataset.thumbPage);
+        if (e.isIntersecting) {
+          this._thumbVisible.add(page);
+          // High-priority: fetch right away, don't wait for drain
+          this._loadThumbForPage(page);
+        } else {
+          this._thumbVisible.delete(page);
+        }
+      }
+    }, { root: strip, rootMargin: '200px' });
+    strip.querySelectorAll('.thumb-item').forEach(el => this._thumbObserver.observe(el));
+
+    // Promote any already-loaded reading pages directly into thumbs (free
+    // bitmaps the user already paid for).
     for (const [p, url] of this.bitmapCache) {
       this.populateThumbnail(p, url);
     }
 
     this.updateThumbStripCurrent();
+    // Kick off the background drain. It runs slowly so it doesn't compete
+    // with reader fetches; the user's high-priority taps still win because
+    // they go through the visible-first path.
+    this._scheduleThumbDrain();
   }
 
-  // Upgrade a thumb-item from placeholder to actual image. Called from
-  // attachImage when a page's blob URL becomes available.
-  populateThumbnail(pageIndex, url) {
+  // Display a thumb blob URL inside the strip cell.
+  _displayThumb(pageIndex, thumbUrl) {
     const strip = $('thumb-strip');
     if (!strip) return;
     const item = strip.querySelector(`.thumb-item[data-thumb-page="${pageIndex}"]`);
     if (!item) return;
     if (item.querySelector('img')) return;  // already populated
-    // Keep the page number as a small overlay label so the user can still
-    // see which page each thumb is.
     item.innerHTML =
-      `<img alt="" src="${url}">` +
+      `<img alt="" src="${thumbUrl}">` +
       `<span class="thumb-label">${pageIndex + 1}</span>`;
+  }
+
+  // Called from attachImage when a full-resolution page bitmap becomes
+  // available. We downscale and save the thumbnail piggyback on the work
+  // the reader already did — no extra network needed.
+  async populateThumbnail(pageIndex, fullUrl) {
+    if (this.cancelled) return;
+    if (!this._pageThumbBlobs || this._pageThumbBlobs.has(pageIndex)) return;
+    if (this._thumbInflight && this._thumbInflight.has(pageIndex)) return;
+
+    // Claim the slot so concurrent _loadThumbForPage calls for the same
+    // page short-circuit. Without this, the background drain could
+    // duplicate the work we're about to do.
+    const work = (async () => {
+      try {
+        // The 'fullUrl' is a blob: URL pointing to the full-res image we
+        // already have in memory. Fetch it back to a Blob, downscale on
+        // Canvas, then both cache and display.
+        const resp = await fetch(fullUrl);
+        const fullBlob = await resp.blob();
+        if (this.cancelled) return;
+        const thumbBlob = await makeThumbBlob(fullBlob);
+        if (this.cancelled || !thumbBlob) return;
+        putCachedPageThumb(this.file.id, pageIndex, thumbBlob);  // fire and forget
+        this._storeAndDisplayThumb(pageIndex, thumbBlob);
+      } catch (e) {
+        console.warn('Thumbnail downscale failed for page', pageIndex, e);
+      }
+    })().finally(() => {
+      if (this._thumbInflight) this._thumbInflight.delete(pageIndex);
+    });
+
+    if (this._thumbInflight) this._thumbInflight.set(pageIndex, work);
+    return work;
+  }
+
+  // Wraps a thumbnail Blob in an object URL, stores it in the per-reader
+  // memory cache, and writes it into the strip DOM.
+  _storeAndDisplayThumb(pageIndex, thumbBlob) {
+    if (this.cancelled || !this._pageThumbBlobs) return;
+    if (this._pageThumbBlobs.has(pageIndex)) return;
+    const url = URL.createObjectURL(thumbBlob);
+    this._pageThumbBlobs.set(pageIndex, url);
+    this._displayThumb(pageIndex, url);
+  }
+
+  // Single-page thumb loader. Idempotent and dedupes concurrent calls for
+  // the same page. Sources tried in order: memory → IndexedDB → ZIP fetch.
+  // Used by both visible-first (IntersectionObserver) and the background
+  // drain. ZIP fetches go through the SAME global Drive gate as reader
+  // pages — but at a smaller byte size and only when the gate has room.
+  async _loadThumbForPage(pageIndex) {
+    if (this.cancelled) return;
+    if (!this._pageThumbBlobs) return;
+    if (this._pageThumbBlobs.has(pageIndex)) return;
+    if (this._thumbInflight.has(pageIndex)) return this._thumbInflight.get(pageIndex);
+
+    const p = (async () => {
+      // 1. Memory: already checked above. Try IndexedDB next.
+      try {
+        const cached = await getCachedPageThumb(this.file.id, pageIndex);
+        if (this.cancelled) return;
+        if (cached) {
+          this._storeAndDisplayThumb(pageIndex, cached);
+          return;
+        }
+      } catch {}
+
+      // 2. Maybe the full-res page was loaded by the reader meanwhile —
+      //    cheaper to downscale that than to fetch from ZIP again.
+      if (this.bitmapCache.has(pageIndex)) {
+        await this.populateThumbnail(pageIndex, this.bitmapCache.get(pageIndex));
+        return;
+      }
+
+      // 3. Fetch the page from the ZIP, downscale it, cache both layers.
+      const ctl = new AbortController();
+      this._thumbAborts.set(pageIndex, ctl);
+      try {
+        const entry = this.imageEntries[pageIndex];
+        if (!entry) return;
+        const bytes = await this.zip.readEntry(entry, ctl.signal);
+        if (this.cancelled || ctl.signal.aborted) return;
+        const ext = entry.name.split('.').pop().toLowerCase();
+        const mime = ext === 'png' ? 'image/png'
+                   : ext === 'webp' ? 'image/webp'
+                   : ext === 'gif' ? 'image/gif'
+                   : ext === 'bmp' ? 'image/bmp'
+                   : ext === 'avif' ? 'image/avif'
+                   : 'image/jpeg';
+        const fullBlob = new Blob([bytes], { type: mime });
+        const thumbBlob = await makeThumbBlob(fullBlob);
+        if (this.cancelled || ctl.signal.aborted || !thumbBlob) return;
+        putCachedPageThumb(this.file.id, pageIndex, thumbBlob);
+        this._storeAndDisplayThumb(pageIndex, thumbBlob);
+      } catch (e) {
+        // Suppress — thumbs aren't critical, the user can still page-jump
+        // using the number input or by tapping the placeholder.
+      } finally {
+        this._thumbAborts.delete(pageIndex);
+      }
+    })().finally(() => {
+      this._thumbInflight.delete(pageIndex);
+    });
+
+    this._thumbInflight.set(pageIndex, p);
+    return p;
+  }
+
+  // Background drain: loads remaining thumbnails one at a time when the
+  // reader is otherwise idle. Skips pages that are already loaded (cache
+  // hit or memory). Self-rescheduling so it can yield between fetches.
+  _scheduleThumbDrain() {
+    if (this._thumbDrainTimer) return;
+    // Use requestIdleCallback when available for true "only when the user
+    // isn't busy" scheduling; otherwise fall back to a polite setTimeout.
+    const schedule = (cb) => {
+      if (typeof requestIdleCallback === 'function') {
+        this._thumbDrainTimer = requestIdleCallback(cb, { timeout: 2000 });
+      } else {
+        this._thumbDrainTimer = setTimeout(cb, 300);
+      }
+    };
+    const cancel = () => {
+      if (!this._thumbDrainTimer) return;
+      if (typeof cancelIdleCallback === 'function') {
+        try { cancelIdleCallback(this._thumbDrainTimer); } catch {}
+      } else {
+        clearTimeout(this._thumbDrainTimer);
+      }
+      this._thumbDrainTimer = null;
+    };
+    this._cancelThumbDrain = cancel;
+
+    const tick = async () => {
+      this._thumbDrainTimer = null;
+      if (this.cancelled || !this._pageThumbBlobs) return;
+      // Build a priority order: visible first, then near the current
+      // slot, then the rest. We pick ONE missing page per tick to keep
+      // the load light. The reader's foreground fetches always have
+      // priority via the global Drive gate.
+      const n = this.imageEntries.length;
+      const cur = this._realPage(
+        (this.slots[this.currentSlotIndex] || [0])[0]
+      ) ?? 0;
+      const isMissing = (i) => !this._pageThumbBlobs.has(i) && !this._thumbInflight.has(i);
+
+      // Visible first
+      let target = null;
+      for (const v of this._thumbVisible) {
+        if (isMissing(v)) { target = v; break; }
+      }
+      // Then by distance from current page (expanding outwards)
+      if (target === null) {
+        for (let r = 0; r < n; r++) {
+          if (cur + r < n && isMissing(cur + r)) { target = cur + r; break; }
+          if (cur - r >= 0 && isMissing(cur - r)) { target = cur - r; break; }
+        }
+      }
+
+      if (target === null) {
+        // All done — nothing more to drain
+        this._cancelThumbDrain = null;
+        return;
+      }
+
+      try {
+        await this._loadThumbForPage(target);
+      } catch {}
+
+      // Reschedule for the next page. The idle callback / timeout ensures
+      // we don't busy-loop hammering the network.
+      if (!this.cancelled) schedule(tick);
+    };
+
+    schedule(tick);
   }
 
   // Highlight the thumb for the current slot and scroll it into view so
@@ -3077,585 +3390,3 @@ class Reader {
     const n = this.imageEntries.length;
     let p = parseInt(pageNumber1, 10) - 1;
     if (isNaN(p)) return;
-    if (p < 0) p = 0;
-    if (p >= n) p = n - 1;
-    const slotIdx = this.findSlotForPage(p);
-    if (slotIdx === this.currentSlotIndex) return;
-    this.currentSlotIndex = slotIdx;
-    this.scrollToSlot(slotIdx, false);
-    this._settleSlot();
-  }
-
-  // Returns a Set of page indices that should NOT be evicted from cache —
-  // namely, every page in the current preload window.
-  _protectedPages() {
-    const FORWARD = 4, BACKWARD = 1;
-    const protectedSet = new Set();
-    for (let i = -BACKWARD; i <= FORWARD; i++) {
-      const k = this.currentSlotIndex + i;
-      if (k < 0 || k >= this.slots.length) continue;
-      for (const it of this.slots[k]) {
-        const p = this._realPage(it);
-        if (p !== null) protectedSet.add(p);
-      }
-    }
-    return protectedSet;
-  }
-
-  evictCache() {
-    if (this.bitmapCache.size <= this.cacheLimit) return;
-    const protectedSet = this._protectedPages();
-    // Walk the LRU order (Map iteration = insertion order, oldest first)
-    // and evict the first non-protected entries. If everything is protected
-    // we leave the cache slightly oversized rather than evict something we
-    // need — the next preload pass will balance things out.
-    for (const oldestKey of [...this.bitmapCache.keys()]) {
-      if (this.bitmapCache.size <= this.cacheLimit) break;
-      if (protectedSet.has(oldestKey)) continue;
-      const url = this.bitmapCache.get(oldestKey);
-      URL.revokeObjectURL(url);
-      this.bitmapCache.delete(oldestKey);
-      // Don't rewrite the DOM here. The cell for an evicted page is far
-      // off-screen; if the user scrolls back, preload() will re-trigger
-      // loadPage which sets up the spinner placeholder before fetching.
-      // (Previously we forced a spinner here, which sometimes overwrote a
-      // visible image when the cache was tight, creating the "spinner that
-      // never resolves" bug.)
-    }
-  }
-
-  setViewMode(mode) {
-    if (mode === this.viewMode) return;
-    const currentPage = this._realPage((this.slots[this.currentSlotIndex] || [0])[0]) || 0;
-    this.viewMode = mode;
-    localStorage.setItem(STORAGE_VIEW_MODE, mode);
-    this.updateViewModeIcon();
-    this.updatePairOffsetButton();
-    this.buildSlots();
-    this.currentSlotIndex = this.findSlotForPage(currentPage);
-    this.renderSlots();
-    requestAnimationFrame(() => {
-      this.scrollToSlot(this.currentSlotIndex, false);
-      this.updateCounter();
-      this.preload();
-    });
-  }
-
-  toggleViewMode() {
-    this.setViewMode(this.viewMode === 'single' ? 'spread' : 'single');
-  }
-
-  // Toggle split mode: when ON, every source image is treated as a 2-page
-  // spread and rendered as two virtual half-pages (right half first for RTL).
-  // Useful for archives where the original scanner left two pages joined.
-  toggleSplitMode() {
-    const currentPage = this._realPage((this.slots[this.currentSlotIndex] || [0])[0]) || 0;
-    this.splitMode = !this.splitMode;
-    localStorage.setItem(STORAGE_SPLIT_MODE, this.splitMode ? 'on' : 'off');
-    this.updateSplitModeIcon();
-    this.buildSlots();
-    this.currentSlotIndex = this.findSlotForPage(currentPage);
-    this.renderSlots();
-    requestAnimationFrame(() => {
-      this.scrollToSlot(this.currentSlotIndex, false);
-      this.updateCounter();
-      this.preload();
-    });
-    // Re-attach already-cached images so the half-page CSS applies
-    for (const [pageIdx, url] of this.bitmapCache) {
-      this.attachImage(pageIdx, url);
-    }
-    toast(this.splitMode ? '見開き分割: ON' : '見開き分割: OFF', 1200);
-  }
-
-  togglePairOffset() {
-    if (this.viewMode !== 'spread') return;
-    const currentPage = this._realPage((this.slots[this.currentSlotIndex] || [0])[0]) || 0;
-    this.pairOffset = this.pairOffset === 0 ? 1 : 0;
-    setProgress(this.file.id, currentPage, { pairOffset: this.pairOffset });
-    this.buildSlots();
-    this.currentSlotIndex = this.findSlotForPage(currentPage);
-    this.renderSlots();
-    requestAnimationFrame(() => {
-      this.scrollToSlot(this.currentSlotIndex, false);
-      this.updateCounter();
-      this.preload();
-    });
-    toast(this.pairOffset === 0 ? '表紙単独' : '表紙からペア', 1200);
-  }
-
-  updateViewModeIcon() {
-    // Show the icon of the OTHER mode (i.e. what clicking will switch TO)
-    const next = this.viewMode === 'single' ? 'spread' : 'single';
-    $('view-mode-btn').innerHTML = VIEW_MODE_ICONS[next];
-    $('view-mode-btn').title = next === 'spread' ? 'Switch to spread view' : 'Switch to single page';
-  }
-
-  updateSplitModeIcon() {
-    // Show the state-of-button icon: 'on' icon when split mode is active,
-    // 'off' otherwise. The button always toggles between the two states.
-    const btn = $('split-mode-btn');
-    if (!btn) return;
-    btn.innerHTML = SPLIT_MODE_ICONS[this.splitMode ? 'on' : 'off'];
-    btn.title = this.splitMode ? '見開き分割: ON (タップで解除)' : '見開き分割: OFF (タップで分割)';
-    btn.classList.toggle('active', this.splitMode);
-  }
-
-  updatePairOffsetButton() {
-    // Pair-offset toggle is meaningful only when reading in spread mode.
-    const btn = $('pair-offset-btn');
-    if (!btn) return;
-    btn.classList.toggle('hidden', this.viewMode !== 'spread');
-  }
-
-  destroy() {
-    this.cancelled = true;
-    if (this._scrollHandler) {
-      $('reader-pages').removeEventListener('scroll', this._scrollHandler);
-      this._scrollHandler = null;
-    }
-    // Abort all in-flight loads so the underlying fetches release their
-    // network/Drive slots immediately. Without this, opening a new file
-    // would still wait for the old file's preload pages to finish.
-    if (this._inflightAborts) {
-      for (const ctl of this._inflightAborts.values()) ctl.abort();
-      this._inflightAborts.clear();
-    }
-    for (const url of this.bitmapCache.values()) URL.revokeObjectURL(url);
-    this.bitmapCache.clear();
-    this.loading.clear();
-    if (this._loadQueue) this._loadQueue.length = 0;
-    // Clear the strip so the next reader doesn't briefly flash stale thumbs.
-    const strip = $('thumb-strip');
-    if (strip) strip.innerHTML = '';
-    // Ensure both overlays are hidden for the new reader so we start clean.
-    $('reader-bottom-overlay').classList.add('hidden-overlay');
-  }
-}
-
-function openZip(file, seriesCtx) {
-  pushNav();
-  if (state.reader) state.reader.destroy();
-  state.reader = new Reader(file, seriesCtx);
-  state.reader.start();
-}
-
-function closeReader() {
-  if (state.reader) {
-    state.reader.destroy();
-    state.reader = null;
-  }
-  if (isFullscreen()) {
-    const exitFn = document.exitFullscreen || document.webkitExitFullscreen;
-    if (exitFn) exitFn.call(document);
-  }
-  // CRITICAL: switch screens synchronously. When called from popstate (e.g.
-  // tablet swipe-back), Safari freezes a snapshot of the previous page during
-  // the swipe animation. If we await anything here, the DOM isn't updated by
-  // the time the snapshot fades out — the user sees the old reader screen
-  // come back, then a delayed swap to the file list. Saving progress to
-  // Drive must happen in the background.
-  if (state.history) renderHistory();
-  else if (state.searching) renderFileList(state.searchResults);
-  else renderFileList(state.currentFiles);
-  showScreen('browser-screen');
-  flushProgressSave().catch(() => {});  // fire-and-forget
-}
-
-//===========================================================================
-// UI wiring
-//===========================================================================
-function wireSignIn() {
-  const input = $('client-id');
-  const btn = $('signin-btn');
-
-  // Allow Client ID via query string for first-time setup or sharing a link:
-  // ?clientId=xxx.apps.googleusercontent.com
-  const params = new URLSearchParams(location.search);
-  const fromQuery = params.get('clientId');
-  if (fromQuery && fromQuery.includes('.apps.googleusercontent.com')) {
-    localStorage.setItem(STORAGE_CLIENT_ID, fromQuery.trim());
-    // Strip the param from the URL so it doesn't linger in history
-    const cleanUrl = location.pathname + location.hash;
-    history.replaceState(null, '', cleanUrl);
-  }
-
-  const saved = localStorage.getItem(STORAGE_CLIENT_ID);
-  if (saved) input.value = saved;
-
-  const validate = () => {
-    btn.disabled = !input.value.trim().includes('.apps.googleusercontent.com');
-  };
-  input.addEventListener('input', validate);
-  validate();
-
-  btn.addEventListener('click', () => {
-    const v = input.value.trim();
-    state.clientId = v;
-    localStorage.setItem(STORAGE_CLIENT_ID, v);
-    requestSignIn(true);  // explicit user action → fall back to consent prompt
-  });
-
-  // Defensive try/catch around the auto-flow: if anything throws (corrupt
-  // localStorage, unexpected DOM state, etc.) we MUST still leave the user
-  // looking at the working sign-in form rather than a black screen.
-  try {
-    if (saved) {
-      state.clientId = saved;
-      // Fast-path: stored access token still valid → skip GIS round trip
-      if (loadStoredToken()) {
-        scheduleProactiveTokenRefresh();
-        // Defer onSignedIn to a microtask so any sync throw bubbles up to
-        // the catch below rather than orphaning the signin screen in a
-        // half-hidden state.
-        Promise.resolve().then(() => onSignedIn()).catch(err => {
-          console.error('Auto sign-in (token path) failed:', err);
-          // Force signin screen back into view
-          showScreen('signin-screen');
-          showAutoSignInState(false);
-        });
-        // Lazily prepare tokenClient for future refreshes
-        const wait = setInterval(() => {
-          if (initTokenClient() || !state.clientId) clearInterval(wait);
-        }, 100);
-        return;
-      }
-      // No valid stored token → GIS silent attempt
-      autoSignIn();
-    }
-  } catch (err) {
-    console.error('wireSignIn auto-flow failed:', err);
-    showScreen('signin-screen');
-    showAutoSignInState(false);
-  }
-}
-
-function showAutoSignInState(on) {
-  $('signin-form').classList.toggle('hidden', on);
-  $('auto-signin-status').classList.toggle('hidden', !on);
-}
-
-function requestSignIn(allowConsentPrompt) {
-  if (!initTokenClient()) {
-    const start = Date.now();
-    const wait = setInterval(() => {
-      if (initTokenClient()) {
-        clearInterval(wait);
-        state.tokenClient.requestAccessToken({ prompt: allowConsentPrompt ? 'consent' : '' });
-      } else if (Date.now() - start > 5000) {
-        clearInterval(wait);
-        toast('Could not load Google Sign-In — check your network');
-      }
-    }, 100);
-    return;
-  }
-  state.tokenClient.requestAccessToken({ prompt: allowConsentPrompt ? 'consent' : '' });
-}
-
-async function autoSignIn() {
-  showAutoSignInState(true);
-  // Wait for GIS to finish loading (script is async/defer).
-  if (!initTokenClient()) {
-    const start = Date.now();
-    while (!initTokenClient()) {
-      if (Date.now() - start > 5000) {
-        showAutoSignInState(false);
-        return;
-      }
-      await new Promise(r => setTimeout(r, 100));
-    }
-  }
-  // Override callback so a silent failure does not toast — that's expected.
-  const origCb = state.tokenClient.callback;
-  state.tokenClient.callback = (resp) => {
-    if (resp.error) {
-      // Silent attempt failed. Restore default callback and show the form.
-      state.tokenClient.callback = origCb;
-      showAutoSignInState(false);
-      return;
-    }
-    origCb(resp);
-  };
-  state.tokenClient.requestAccessToken({ prompt: '' });
-}
-
-function wireBrowser() {
-  $('back-btn').addEventListener('click', navBack);
-  $('signout-btn').addEventListener('click', signOut);
-  updateSortButton();
-
-  $('sort-btn').addEventListener('click', async () => {
-    const next = cycleSortMode();
-    toast(SORT_LABELS[next], 1200);
-    // If we just switched to a modified-time sort, peek inside each folder
-    // for its real "most recent change" timestamp before re-sorting. Cached,
-    // so flipping back and forth is fast.
-    const needsEnrich = next === 'modified_desc' || next === 'modified_asc';
-    if (needsEnrich) {
-      const list = state.searching ? state.searchResults : state.currentFiles;
-      if (list && list.length) await enrichFolderModifiedTimes(list);
-    }
-    const cmp = makeSortComparator();
-    if (state.history) {
-      // History uses its own sort (always by recency), so just re-render
-      renderHistory();
-    } else if (state.searching) {
-      state.searchResults.sort((a, b) => {
-        if (isFolder(a) !== isFolder(b)) return isFolder(a) ? 1 : -1;
-        return cmp(a, b);
-      });
-      renderFileList(state.searchResults);
-    } else {
-      state.currentFiles.sort((a, b) => {
-        const aShared = !!a._shared, bShared = !!b._shared;
-        if (aShared !== bShared) return aShared ? -1 : 1;
-        if (isFolder(a) !== isFolder(b)) return isFolder(a) ? -1 : 1;
-        return cmp(a, b);
-      });
-      renderFileList(state.currentFiles);
-    }
-  });
-
-  $('history-btn').addEventListener('click', () => {
-    if (state.history) navBack();
-    else enterHistoryMode();
-  });
-
-  $('search-btn').addEventListener('click', () => {
-    if (!$('search-box').classList.contains('hidden')) {
-      navBack();
-    } else {
-      enterSearchMode();
-    }
-  });
-
-  $('search-input').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') {
-      const q = e.target.value.trim();
-      if (q) runSearch(q);
-    } else if (e.key === 'Escape') {
-      navBack();
-    }
-  });
-
-  $('search-clear').addEventListener('click', () => {
-    const inp = $('search-input');
-    if (inp.value) {
-      inp.value = '';
-      inp.focus();
-    } else {
-      navBack();
-    }
-  });
-}
-
-function wireReader() {
-  $('reader-close').addEventListener('click', navBack);
-  $('view-mode-btn').addEventListener('click', () => {
-    if (state.reader) state.reader.toggleViewMode();
-  });
-  $('split-mode-btn').addEventListener('click', () => {
-    if (state.reader) state.reader.toggleSplitMode();
-  });
-  $('pair-offset-btn').addEventListener('click', () => {
-    if (state.reader) state.reader.togglePairOffset();
-  });
-  $('fullscreen-btn').addEventListener('click', toggleFullscreen);
-  updateFullscreenIcon();
-
-  // Page-jump: number input + button. Pressing Enter inside the input
-  // triggers the same jump. We don't auto-jump on every keystroke because
-  // the user is often typing a multi-digit number ("123") and we'd otherwise
-  // navigate to page 1, then 12, then 123 mid-typing.
-  const jumpInput = $('page-jump-input');
-  const doJump = () => {
-    if (!state.reader) return;
-    const v = jumpInput.value.trim();
-    if (!v) return;
-    state.reader.jumpToPage(v);
-    jumpInput.blur();  // dismiss mobile keyboard
-  };
-  $('page-jump-btn').addEventListener('click', doJump);
-  jumpInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      doJump();
-    }
-  });
-
-  // Tap zones: use the coordinate of the click on #reader-pages itself, so
-  // we don't need overlay elements that block native swipe-to-scroll.
-  // Left third → next (RTL advance), middle → toggle overlay, right third → prev.
-  $('reader-pages').addEventListener('click', (e) => {
-    if (!state.reader) return;
-    // On the next-volume sentinel slot, any tap (including the middle area)
-    // advances to the next volume. Otherwise the user would have to find
-    // the left third — confusing on a "press to continue" prompt.
-    const cur = state.reader.slots[state.reader.currentSlotIndex];
-    if (cur && cur[0] === '__next__') {
-      state.reader.next();
-      return;
-    }
-    const rect = e.currentTarget.getBoundingClientRect();
-    const xRatio = (e.clientX - rect.left) / rect.width;
-    if (xRatio < 1/3)       state.reader.next();
-    else if (xRatio > 2/3)  state.reader.prev();
-    else {
-      // Middle tap toggles BOTH overlays together so the thumbnail strip
-      // and page-jump appear at the same time as the title bar.
-      $('reader-overlay').classList.toggle('hidden-overlay');
-      $('reader-bottom-overlay').classList.toggle('hidden-overlay');
-      // When opening, scroll the strip to center on the current page.
-      if (!$('reader-bottom-overlay').classList.contains('hidden-overlay')) {
-        state.reader.updateThumbStripCurrent();
-      }
-    }
-  });
-
-  document.addEventListener('keydown', (e) => {
-    if ($('reader-screen').classList.contains('hidden')) return;
-    // Don't capture key events from form controls like the search box
-    if (e.target.matches && e.target.matches('input, textarea, select')) return;
-
-    let handled = true;
-    if (e.key === 'Escape') {
-      // If browser is exiting fullscreen on Esc, don't also close the reader
-      if (isFullscreen()) { handled = false; }
-      else navBack();
-    }
-    else if (e.key === 'ArrowLeft')  { if (state.reader) state.reader.next(); }   // RTL
-    else if (e.key === 'ArrowRight') { if (state.reader) state.reader.prev(); }
-    else if (e.key === 'v' || e.key === 'V') { if (state.reader) state.reader.toggleViewMode(); }
-    else if (e.key === 'p' || e.key === 'P') { if (state.reader) state.reader.togglePairOffset(); }
-    else if (e.key === 'f' || e.key === 'F') toggleFullscreen();
-    else if (e.key === 'g' || e.key === 'G') {
-      // Open the bottom overlay (if hidden) and focus the page-jump input
-      $('reader-overlay').classList.remove('hidden-overlay');
-      $('reader-bottom-overlay').classList.remove('hidden-overlay');
-      const inp = $('page-jump-input');
-      if (inp) { inp.focus(); inp.select(); }
-      if (state.reader) state.reader.updateThumbStripCurrent();
-    }
-    else handled = false;
-
-    // Prevent the browser's native scrolling behavior for keys we handle
-    // ourselves. Without this, ArrowLeft/Right would scroll #reader-pages
-    // by ~40px before our scrollIntoView() takes over, briefly revealing
-    // the neighboring slot.
-    if (handled) e.preventDefault();
-  });
-}
-
-//===========================================================================
-// In-app history navigation
-//===========================================================================
-// Captures the browser's back action (back button, swipe-from-edge gesture
-// on tablets, Esc key) and routes it to "go one step back inside the app"
-// instead of letting the browser leave the page.
-//
-// Strategy: each forward navigation (entering a folder, opening a file,
-// entering search/history mode) calls pushNav() which adds a marked entry
-// to history.state. On popstate we look at the new state.depth — if it's
-// less than what we last pushed, the user went back, so we step back inside
-// the app. Going back past depth 0 lets the browser leave naturally.
-
-let navDepth = 0;
-
-function initNav() {
-  // Mark the initial entry so we can recognize "our" history entries.
-  if (!history.state || history.state.app !== 'mangaStreamer') {
-    history.replaceState({ app: 'mangaStreamer', depth: 0 }, '', location.href);
-  } else {
-    navDepth = history.state.depth || 0;
-  }
-  window.addEventListener('popstate', onPopState);
-}
-
-function pushNav() {
-  navDepth++;
-  history.pushState({ app: 'mangaStreamer', depth: navDepth }, '', location.href);
-}
-
-function onPopState(e) {
-  const target = (e.state && e.state.app === 'mangaStreamer')
-    ? (e.state.depth | 0)
-    : 0;
-  if (target < navDepth) {
-    navDepth = target;
-    handleSystemBack();
-  }
-  // target > navDepth (forward navigation) is ignored; we don't restore
-  // forward state because each pushNav represents a one-way transition.
-}
-
-function handleSystemBack() {
-  // Order matches navigation precedence: innermost screens close first.
-  if (!$('reader-screen').classList.contains('hidden')) {
-    closeReader();
-    return;
-  }
-  if (state.history) {
-    loadCurrentFolder();
-    return;
-  }
-  if (state.searching || !$('search-box').classList.contains('hidden')) {
-    $('search-input').value = '';
-    loadCurrentFolder();
-    return;
-  }
-  if (state.folderStack.length > 1) {
-    state.folderStack.pop();
-    loadCurrentFolder();
-    return;
-  }
-  // At root: nothing to do. The next swipe-back will leave the page.
-}
-
-function navBack() {
-  // Internal "back" trigger used by close buttons, Esc key, etc.
-  // Routes through history so popstate is the single source of truth.
-  if (navDepth > 0) {
-    history.back();
-  } else {
-    // Already at app root — nothing to undo
-    toast('Already at top');
-  }
-}
-
-window.addEventListener('DOMContentLoaded', () => {
-  // Global safety net: if startup throws something we didn't anticipate
-  // (corrupt localStorage, missing DOM, GIS load failure, etc.) we DON'T
-  // want the user staring at a half-rendered black screen. This handler
-  // forces the sign-in form back into view and dismisses the loading
-  // spinner. The user can then click Sign In (or clear data) to retry.
-  const recover = (label) => (ev) => {
-    const err = ev && (ev.error || ev.reason || ev.message) || '(unknown)';
-    console.error('[startup recovery]', label, err);
-    try {
-      const ss = document.getElementById('signin-screen');
-      const bs = document.getElementById('browser-screen');
-      const rs = document.getElementById('reader-screen');
-      if (ss) ss.classList.remove('hidden');
-      if (bs) bs.classList.add('hidden');
-      if (rs) rs.classList.add('hidden');
-      const sf = document.getElementById('signin-form');
-      const ss2 = document.getElementById('auto-signin-status');
-      if (sf) sf.classList.remove('hidden');
-      if (ss2) ss2.classList.add('hidden');
-    } catch {}
-  };
-  window.addEventListener('error', recover('window.error'));
-  window.addEventListener('unhandledrejection', recover('unhandledrejection'));
-
-  try {
-    initNav();
-    wireSignIn();
-    wireBrowser();
-    wireReader();
-  } catch (err) {
-    recover('DOMContentLoaded sync')({ error: err });
-  }
-});
-</script>
-</body>
-</html>
