@@ -1112,10 +1112,30 @@ async function _driveFetchInner(url, init, tag) {
     'Authorization': 'Bearer ' + state.accessToken,
   });
 
+  // Build a clean RequestInit to pass to fetch(). We must NOT pass our
+  // internal `priority` field — fetch() treats `priority` as the standard
+  // FetchPriority enum ('high'/'low'/'auto') and throws a TypeError on
+  // any other value. Same for our custom `timeoutMs`. Pull out only the
+  // fields fetch knows about.
+  const fetchInit = {
+    method: init.method,
+    headers: headers,
+    body: init.body,
+    mode: init.mode,
+    credentials: init.credentials,
+    cache: init.cache,
+    redirect: init.redirect,
+    signal,
+  };
+  // Drop undefined keys so we don't override fetch defaults with `undefined`
+  for (const k of Object.keys(fetchInit)) {
+    if (fetchInit[k] === undefined) delete fetchInit[k];
+  }
+
   const doFetch = async (hdrs) => {
     try {
       console.log(tag, 'fetch starting');
-      const r = await fetch(url, Object.assign({}, init, { headers: hdrs, signal }));
+      const r = await fetch(url, Object.assign({}, fetchInit, { headers: hdrs }));
       console.log(tag, 'fetch resolved, status=', r.status);
       return r;
     } catch (err) {
@@ -4503,3 +4523,107 @@ function wireReader() {
 //
 // Strategy: each forward navigation (entering a folder, opening a file,
 // entering search/history mode) calls pushNav() which adds a marked entry
+// to history.state. On popstate we look at the new state.depth — if it's
+// less than what we last pushed, the user went back, so we step back inside
+// the app. Going back past depth 0 lets the browser leave naturally.
+
+let navDepth = 0;
+
+function initNav() {
+  // Mark the initial entry so we can recognize "our" history entries.
+  if (!history.state || history.state.app !== 'mangaStreamer') {
+    history.replaceState({ app: 'mangaStreamer', depth: 0 }, '', location.href);
+  } else {
+    navDepth = history.state.depth || 0;
+  }
+  window.addEventListener('popstate', onPopState);
+}
+
+function pushNav() {
+  navDepth++;
+  history.pushState({ app: 'mangaStreamer', depth: navDepth }, '', location.href);
+}
+
+function onPopState(e) {
+  const target = (e.state && e.state.app === 'mangaStreamer')
+    ? (e.state.depth | 0)
+    : 0;
+  if (target < navDepth) {
+    navDepth = target;
+    handleSystemBack();
+  }
+  // target > navDepth (forward navigation) is ignored; we don't restore
+  // forward state because each pushNav represents a one-way transition.
+}
+
+function handleSystemBack() {
+  // Order matches navigation precedence: innermost screens close first.
+  if (!$('reader-screen').classList.contains('hidden')) {
+    closeReader();
+    return;
+  }
+  if (state.history) {
+    loadCurrentFolder();
+    return;
+  }
+  if (state.searching || !$('search-box').classList.contains('hidden')) {
+    $('search-input').value = '';
+    loadCurrentFolder();
+    return;
+  }
+  if (state.folderStack.length > 1) {
+    state.folderStack.pop();
+    loadCurrentFolder();
+    return;
+  }
+  // At root: nothing to do. The next swipe-back will leave the page.
+}
+
+function navBack() {
+  // Internal "back" trigger used by close buttons, Esc key, etc.
+  // Routes through history so popstate is the single source of truth.
+  if (navDepth > 0) {
+    history.back();
+  } else {
+    // Already at app root — nothing to undo
+    toast('Already at top');
+  }
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+  // Global safety net: if startup throws something we didn't anticipate
+  // (corrupt localStorage, missing DOM, GIS load failure, etc.) we DON'T
+  // want the user staring at a half-rendered black screen. This handler
+  // forces the sign-in form back into view and dismisses the loading
+  // spinner. The user can then click Sign In (or clear data) to retry.
+  const recover = (label) => (ev) => {
+    const err = ev && (ev.error || ev.reason || ev.message) || '(unknown)';
+    console.error('[startup recovery]', label, err);
+    try {
+      const ss = document.getElementById('signin-screen');
+      const bs = document.getElementById('browser-screen');
+      const rs = document.getElementById('reader-screen');
+      if (ss) ss.classList.remove('hidden');
+      if (bs) bs.classList.add('hidden');
+      if (rs) rs.classList.add('hidden');
+      const sf = document.getElementById('signin-form');
+      const ss2 = document.getElementById('auto-signin-status');
+      if (sf) sf.classList.remove('hidden');
+      if (ss2) ss2.classList.add('hidden');
+    } catch {}
+  };
+  window.addEventListener('error', recover('window.error'));
+  window.addEventListener('unhandledrejection', recover('unhandledrejection'));
+
+  try {
+    initNav();
+    wireSignIn();
+    wireBrowser();
+    wireReader();
+  } catch (err) {
+    recover('DOMContentLoaded sync')({ error: err });
+  }
+});
+</script>
+</body>
+</html>
