@@ -453,6 +453,11 @@
 
   #reader-bottom-overlay { pointer-events: none; }
   #reader-bottom-overlay > * { pointer-events: auto; }
+  /* When the overlay is hidden, its children must also stop intercepting
+     clicks — otherwise the invisible strip and jump row at the bottom of
+     the screen swallow taps meant for #reader-pages (the middle-tap that
+     would open the overlay in the first place). */
+  #reader-bottom-overlay.hidden-overlay > * { pointer-events: none; }
 
   /* Toast */
   #toast {
