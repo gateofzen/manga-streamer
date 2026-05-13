@@ -2254,6 +2254,12 @@ const VOLUME_PATTERNS = [
   { re: /^(.+?)[\s_\-―〜]+(\d+)\s*巻/i,                      kind: 'jp_kan' },
   // 巻NN (Japanese, 巻 prefix) — covers "ナルト 巻01" style
   { re: /^(.+?)[\s_\-―〜]+巻\s*(\d+)/i,                      kind: 'jp_kan_pre' },
+  // NN号 (Japanese magazine issue number). Common for weekly/monthly
+  // magazines like "ビッグコミック_2026年08号" where the next issue is
+  // "09号" of the same year. Separator before the digits is OPTIONAL
+  // because magazine filenames typically run "...年08号" with no space
+  // or underscore between 年 and 08.
+  { re: /^(.+?)[\s_\-―〜]*(\d+)\s*号/,                        kind: 'jp_gou' },
   // (NN) or [NN]
   { re: /^(.+?)[\s_\-―〜]*[\(\[]\s*(\d+)\s*[\)\]]/,           kind: 'paren' },
   // vol. NN / v.NN / vNN / Vol NN  (English)
