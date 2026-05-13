@@ -773,20 +773,30 @@ function makeSortComparator() {
 //
 // Workaround: peek inside each folder for the most recently modified
 // direct child and use that as the folder's effective modifiedTime.
+// We also take the MAX of the peek result and the folder's own
+// modifiedTime so a recently-renamed folder doesn't drop in the list
+// just because its inner content is older than the rename.
 // Results are cached in-memory for the session via _folderPeekCache.
 function effectiveModifiedTime(f) {
-  if (f && f._effectiveModifiedTime) return f._effectiveModifiedTime;
-  return (f && f.modifiedTime) || '';
+  if (!f) return '';
+  const own = f.modifiedTime || '';
+  const peek = f._effectiveModifiedTime || '';
+  // Both are ISO 8601 strings, comparable as strings. Empty sorts last.
+  return peek > own ? peek : own;
 }
 
 const _folderPeekCache = new Map(); // folderId -> ISO timestamp string (or '' if empty)
 const _folderPeekHydrated = { done: false };
 
 // Peek cache lives in IndexedDB so reopens of the folder browser don't
-// pay the per-folder Drive RTT cost again. TTL is generous because most
-// folders' "newest child" doesn't change every minute — when it does, the
-// background refresh below catches it.
-const FOLDER_PEEK_TTL_MS = 24 * 60 * 60 * 1000;  // 24 hours
+// pay the per-folder Drive RTT cost again. But we keep the TTL short
+// (5 min) so newly-added files inside folders show up quickly in the
+// modified-time sort. Even within the TTL window, we still kick off a
+// background re-peek for every visible folder so the order self-corrects
+// when content has changed since the cache was written — the TTL just
+// decides whether the cached value is trustworthy enough to skip the
+// initial network round-trip.
+const FOLDER_PEEK_TTL_MS = 5 * 60 * 1000;  // 5 minutes
 
 async function getCachedFolderPeek(folderId) {
   try {
@@ -835,8 +845,13 @@ async function hydrateFolderPeekCache(folderIds) {
   } catch {}
 }
 
-async function peekFolderModified(folderId) {
-  if (_folderPeekCache.has(folderId)) return _folderPeekCache.get(folderId);
+async function peekFolderModified(folderId, opts = {}) {
+  // bypassCache=true forces a fresh Drive query (used by background
+  // refresh to detect newly-added content even when the cache says
+  // it knows the answer).
+  if (!opts.bypassCache && _folderPeekCache.has(folderId)) {
+    return _folderPeekCache.get(folderId);
+  }
   const params = new URLSearchParams({
     q: `'${folderId}' in parents and trashed = false`,
     fields: 'files(modifiedTime)',
@@ -849,7 +864,7 @@ async function peekFolderModified(folderId) {
   try {
     const resp = await driveFetch('https://www.googleapis.com/drive/v3/files?' + params, { priority: 2 });
     if (!resp.ok) {
-      _folderPeekCache.set(folderId, '');
+      if (!opts.bypassCache) _folderPeekCache.set(folderId, '');
       return '';
     }
     const data = await readBodyJson(resp);
@@ -858,7 +873,7 @@ async function peekFolderModified(folderId) {
     if (ts) putCachedFolderPeek(folderId, ts);  // fire and forget
     return ts;
   } catch {
-    _folderPeekCache.set(folderId, '');
+    if (!opts.bypassCache) _folderPeekCache.set(folderId, '');
     return '';
   }
 }
@@ -2541,68 +2556,77 @@ async function loadCurrentFolder() {
   }
 }
 
-// Refresh folder peek timestamps in the background. Only folders without
-// a fresh cache entry are actually fetched; the rest reuse the IndexedDB
-// hydrated value applied during the initial render. The provided callback
-// re-renders the list once a meaningful number of updates have landed
-// (batched so we don't thrash the DOM on every single peek).
+// Refresh folder peek timestamps in the background. Strategy:
+//   - Folders NOT yet in the in-memory cache: peek immediately (high
+//     priority), they were rendered with raw modifiedTime which is
+//     usually stale, so we need real data ASAP.
+//   - Folders in the cache: ALSO re-peek (lower priority), bypassing
+//     the cache, so any new files added since the last visit show up
+//     in the sort. TTL is no longer used to gate this — we always
+//     re-validate, just deferred for cached folders so initial render
+//     stays fast.
+// The render callback batches DOM updates so we don't thrash on every
+// single peek response.
 function backgroundRefreshFolderPeeks(files, token, onUpdate) {
   const folders = files.filter(isFolder);
   if (!folders.length) return;
-  // Decide which folders need a fresh peek.
-  const stale = [];
+
+  // Bucket folders: never-peeked vs. previously-cached.
+  const neverPeeked = [];
+  const cached = [];
   for (const f of folders) {
-    // We need a peek if: not in memory cache, OR cache is missing TS.
-    // We do NOT re-peek every time — the IndexedDB hydration above
-    // populates _folderPeekCache with persisted values. Only folders we
-    // truly haven't seen, or whose IndexedDB entry is older than TTL,
-    // need a fresh Drive RTT. The TTL check happens via IndexedDB
-    // metadata, fetched alongside the hydration.
-    if (!_folderPeekCache.has(f.id)) stale.push(f);
+    if (_folderPeekCache.has(f.id)) cached.push(f);
+    else neverPeeked.push(f);
   }
-  // Also schedule TTL-expired refreshes (async — they don't block first
-  // render). We check the IndexedDB fetchedAt timestamp for each cached
-  // folder; if older than TTL, queue a refresh.
-  Promise.resolve().then(async () => {
-    for (const f of folders) {
-      if (stale.includes(f)) continue;
-      const cached = await getCachedFolderPeek(f.id);
-      if (cached && Date.now() - (cached.fetchedAt || 0) > FOLDER_PEEK_TTL_MS) {
-        stale.push(f);
-        _folderPeekCache.delete(f.id);  // force re-peek
-      }
-    }
-    if (token !== state._folderLoadToken) return;
-    // Now run the actual peeks in parallel.
-    let updatesSinceRender = 0;
-    let firstUpdate = true;
-    let renderTimer = null;
-    const scheduleRender = () => {
-      if (renderTimer) return;
-      renderTimer = setTimeout(() => {
-        renderTimer = null;
-        if (token !== state._folderLoadToken) return;
-        if (updatesSinceRender === 0) return;
-        updatesSinceRender = 0;
-        onUpdate();
-      }, firstUpdate ? 100 : 400);
-      firstUpdate = false;
-    };
-    await Promise.all(stale.map(async f => {
-      const ts = await peekFolderModified(f.id);
+
+  let updatesSinceRender = 0;
+  let firstUpdate = true;
+  let renderTimer = null;
+  const scheduleRender = () => {
+    if (renderTimer) return;
+    renderTimer = setTimeout(() => {
+      renderTimer = null;
       if (token !== state._folderLoadToken) return;
-      if (ts && ts !== f._effectiveModifiedTime) {
-        f._effectiveModifiedTime = ts;
-        updatesSinceRender++;
-        scheduleRender();
-      }
-    }));
-    // Final render to catch any trailing updates.
-    if (updatesSinceRender > 0 && token === state._folderLoadToken) {
-      if (renderTimer) clearTimeout(renderTimer);
+      if (updatesSinceRender === 0) return;
+      updatesSinceRender = 0;
       onUpdate();
+    }, firstUpdate ? 100 : 400);
+    firstUpdate = false;
+  };
+
+  const applyResult = (f, ts) => {
+    if (token !== state._folderLoadToken) return;
+    if (ts && ts !== f._effectiveModifiedTime) {
+      f._effectiveModifiedTime = ts;
+      updatesSinceRender++;
+      scheduleRender();
     }
+  };
+
+  // PASS 1: peek never-seen folders immediately. They're currently being
+  // displayed with raw modifiedTime (folder metadata time, which can be
+  // wildly wrong), so getting real values matters.
+  Promise.all(neverPeeked.map(async f => {
+    const ts = await peekFolderModified(f.id);
+    applyResult(f, ts);
+  })).then(() => {
+    if (token !== state._folderLoadToken) return;
+    // PASS 2: re-peek cached folders, bypassing the cache, so newly-added
+    // files are reflected. Lower priority than PASS 1, runs sequentially
+    // in batches to avoid swamping the Drive gate. The initial render
+    // already showed cached values which are correct for the common case
+    // where nothing changed — this pass only matters when files HAVE
+    // been added since the last peek.
+    cached.forEach(f => {
+      // Small async delay so PASS 1's renders settle before we start
+      // generating more.
+      peekFolderModified(f.id, { bypassCache: true }).then(ts => applyResult(f, ts));
+    });
   });
+
+  // Final render to catch any trailing updates after all peeks complete.
+  // (Both passes' applyResult calls go through scheduleRender, so the
+  // batching is consistent.)
 }
 
 async function runSearch(query) {
