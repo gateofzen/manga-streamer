@@ -2362,10 +2362,43 @@ async function findNextVolumeInDrive(currentFile) {
   if (tokenKeyword && tokenKeyword.length >= 2 && tokenKeyword !== cleanedSeries) {
     queries.push(tokenKeyword);
   }
-  if (!queries.length) return null;
 
-  // Run searches in parallel
-  const results = await Promise.all(queries.map(async q => {
+  // Also list the file's PARENT folder. Drive's `name contains` text search
+  // is unreliable for short CJK names (tokenization splits them in ways
+  // that miss substring matches), but listing the parent folder always
+  // returns the exact set of siblings. This is the most reliable source
+  // of next-volume candidates — even when the user opened the file from
+  // history (no seriesCtx) or from a different folder than its actual home.
+  const parentListPromise = (async () => {
+    try {
+      // Fetch the file's parents if they aren't already on the file object.
+      let parentIds = currentFile.parents;
+      if (!parentIds || !parentIds.length) {
+        const resp = await driveFetch(
+          `https://www.googleapis.com/drive/v3/files/${currentFile.id}?fields=parents&supportsAllDrives=true`
+        );
+        if (resp.ok) {
+          const data = await readBodyJson(resp);
+          parentIds = data.parents || [];
+        }
+      }
+      if (!parentIds || !parentIds.length) return [];
+      // Usually a file has just one parent. Listing each in parallel handles
+      // the rare multi-parent case (shortcuts, shared items).
+      const lists = await Promise.all(parentIds.map(pid =>
+        listFolder(pid).catch(() => [])
+      ));
+      const flat = lists.flat();
+      console.log('[next-volume] parent folder siblings:', flat.length);
+      return flat;
+    } catch (e) {
+      console.warn('[next-volume] parent folder list failed:', e);
+      return [];
+    }
+  })();
+
+  // Run text searches in parallel with the parent-folder listing.
+  const searchPromises = queries.map(async q => {
     try {
       const r = await searchDrive(q);
       console.log('[next-volume] search', JSON.stringify(q), '→', r.length, 'results');
@@ -2374,17 +2407,27 @@ async function findNextVolumeInDrive(currentFile) {
       console.warn('[next-volume] search failed for', q, e);
       return [];
     }
-  }));
+  });
 
-  // Merge + dedupe by file id, keep ZIPs only, exclude current file
+  const [parentSiblings, ...searchResults] = await Promise.all([
+    parentListPromise,
+    ...searchPromises,
+  ]);
+
+  // Merge + dedupe by file id, keep ZIPs only, exclude current file.
+  // Parent-folder siblings are added first because they're the most
+  // reliable indicator of "same series" (Drive text search can spuriously
+  // pull in unrelated files with substring matches).
   const byId = new Map();
-  for (const list of results) {
+  const addAll = (list) => {
     for (const f of list) {
       if (!isZip(f)) continue;
       if (f.id === currentFile.id) continue;
       if (!byId.has(f.id)) byId.set(f.id, f);
     }
-  }
+  };
+  addAll(parentSiblings);
+  for (const list of searchResults) addAll(list);
   const candidates = [...byId.values()];
   console.log('[next-volume] total unique candidates:', candidates.length);
 
