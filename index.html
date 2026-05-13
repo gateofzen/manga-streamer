@@ -648,6 +648,11 @@ const state = {
   searchResults: [],
   // History
   history: false,
+  // Token incremented every time loadCurrentFolder starts. Background
+  // tasks (folder peek refresh, etc.) check this to abort if the user has
+  // since navigated away — prevents stale results from corrupting the
+  // current view.
+  _folderLoadToken: 0,
 };
 
 const VIEW_MODE_ICONS = {
@@ -775,6 +780,60 @@ function effectiveModifiedTime(f) {
 }
 
 const _folderPeekCache = new Map(); // folderId -> ISO timestamp string (or '' if empty)
+const _folderPeekHydrated = { done: false };
+
+// Peek cache lives in IndexedDB so reopens of the folder browser don't
+// pay the per-folder Drive RTT cost again. TTL is generous because most
+// folders' "newest child" doesn't change every minute — when it does, the
+// background refresh below catches it.
+const FOLDER_PEEK_TTL_MS = 24 * 60 * 60 * 1000;  // 24 hours
+
+async function getCachedFolderPeek(folderId) {
+  try {
+    const db = await openThumbDb();
+    return await new Promise((resolve) => {
+      const tx = db.transaction(FOLDER_PEEK_STORE, 'readonly');
+      const req = tx.objectStore(FOLDER_PEEK_STORE).get(folderId);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => resolve(null);
+    });
+  } catch { return null; }
+}
+
+async function putCachedFolderPeek(folderId, ts) {
+  try {
+    const db = await openThumbDb();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(FOLDER_PEEK_STORE, 'readwrite');
+      tx.objectStore(FOLDER_PEEK_STORE).put({ ts, fetchedAt: Date.now() }, folderId);
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch {}
+}
+
+// Synchronously seed _folderPeekCache from IndexedDB on first use. Returns
+// a promise; awaiting it before rendering means the initial render uses
+// cached peeks (correct order, no flash of unsorted content). Subsequent
+// renders skip this hydration.
+async function hydrateFolderPeekCache(folderIds) {
+  if (!folderIds.length) return;
+  const toFetch = folderIds.filter(id => !_folderPeekCache.has(id));
+  if (!toFetch.length) return;
+  try {
+    const db = await openThumbDb();
+    await Promise.all(toFetch.map(id => new Promise((resolve) => {
+      const tx = db.transaction(FOLDER_PEEK_STORE, 'readonly');
+      const req = tx.objectStore(FOLDER_PEEK_STORE).get(id);
+      req.onsuccess = () => {
+        const v = req.result;
+        if (v && v.ts) _folderPeekCache.set(id, v.ts);
+        resolve();
+      };
+      req.onerror = () => resolve();
+    })));
+  } catch {}
+}
 
 async function peekFolderModified(folderId) {
   if (_folderPeekCache.has(folderId)) return _folderPeekCache.get(folderId);
@@ -788,7 +847,7 @@ async function peekFolderModified(folderId) {
     includeItemsFromAllDrives: 'true',
   });
   try {
-    const resp = await driveFetch('https://www.googleapis.com/drive/v3/files?' + params);
+    const resp = await driveFetch('https://www.googleapis.com/drive/v3/files?' + params, { priority: 2 });
     if (!resp.ok) {
       _folderPeekCache.set(folderId, '');
       return '';
@@ -796,6 +855,7 @@ async function peekFolderModified(folderId) {
     const data = await readBodyJson(resp);
     const ts = (data.files && data.files[0] && data.files[0].modifiedTime) || '';
     _folderPeekCache.set(folderId, ts);
+    if (ts) putCachedFolderPeek(folderId, ts);  // fire and forget
     return ts;
   } catch {
     _folderPeekCache.set(folderId, '');
@@ -1877,14 +1937,16 @@ class ZipReader {
 const THUMB_DB_NAME = 'mangaStreamer.thumbs';
 const THUMB_STORE = 'covers';          // per-file cover (book listing)
 const PAGE_THUMB_STORE = 'pageThumbs'; // per-page small thumbnail keyed "fileId:pageIdx"
+const FOLDER_PEEK_STORE = 'folderPeeks'; // folderId -> { ts, fetchedAt }
 let thumbDbPromise = null;
 
 function openThumbDb() {
   if (thumbDbPromise) return thumbDbPromise;
   thumbDbPromise = new Promise((resolve, reject) => {
-    // Version 2 adds the pageThumbs store; old browsers running v1 will
-    // upgrade transparently and existing cover thumbs are preserved.
-    const req = indexedDB.open(THUMB_DB_NAME, 2);
+    // Version 3 adds folderPeeks (per-folder "most-recent-child" timestamp
+    // cache). Older versions are upgraded transparently — existing thumb
+    // stores carry over.
+    const req = indexedDB.open(THUMB_DB_NAME, 3);
     req.onupgradeneeded = (e) => {
       const db = req.result;
       if (!db.objectStoreNames.contains(THUMB_STORE)) {
@@ -1892,6 +1954,9 @@ function openThumbDb() {
       }
       if (!db.objectStoreNames.contains(PAGE_THUMB_STORE)) {
         db.createObjectStore(PAGE_THUMB_STORE);
+      }
+      if (!db.objectStoreNames.contains(FOLDER_PEEK_STORE)) {
+        db.createObjectStore(FOLDER_PEEK_STORE);
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -2354,6 +2419,9 @@ async function loadCurrentFolder() {
   $('breadcrumb').innerHTML = breadcrumbHtml + '<span class="sync-dot" id="sync-dot"></span>';
 
   $('file-list').innerHTML = '<div class="spinner"></div>';
+  // Token to ignore background updates from a previous folder if the user
+  // navigates away before they finish.
+  const token = ++state._folderLoadToken;
   try {
     const cur = stack[stack.length - 1];
     const isRoot = stack.length === 1 && cur.id === 'root';
@@ -2373,29 +2441,119 @@ async function loadCurrentFolder() {
     } else {
       all = await listFolder(cur.id);
     }
+    if (token !== state._folderLoadToken) return;  // user already navigated
 
     const filtered = all.filter(f => isFolder(f) || isZip(f));
-    // For modified-time sort modes, peek into each folder for its most
-    // recently-modified child and use that as the folder's effective
-    // modifiedTime. Without this, folders sort by their own (often stale)
-    // metadata-change time rather than by when their contents changed.
     const mode = getSortMode();
-    if (mode === 'modified_desc' || mode === 'modified_asc') {
-      await enrichFolderModifiedTimes(filtered);
+    const needsPeek = mode === 'modified_desc' || mode === 'modified_asc';
+
+    // STEP 1: render IMMEDIATELY using whatever timestamp data is on hand.
+    //   - If modified-sort is active, hydrate _folderPeekCache from IndexedDB
+    //     synchronously so the initial render uses correct peek-derived
+    //     timestamps for folders we've seen before. No network involved.
+    //   - For folders we haven't peeked yet, fall back to the folder's raw
+    //     modifiedTime. They MAY rearrange after the background refresh
+    //     completes, but the user sees the list right away.
+    if (needsPeek) {
+      const folderIds = filtered.filter(isFolder).map(f => f.id);
+      await hydrateFolderPeekCache(folderIds);
+      if (token !== state._folderLoadToken) return;
+      // Apply cached peeks (in-memory map now populated)
+      for (const f of filtered) {
+        if (isFolder(f) && _folderPeekCache.has(f.id)) {
+          const ts = _folderPeekCache.get(f.id);
+          if (ts) f._effectiveModifiedTime = ts;
+        }
+      }
     }
-    const cmp = makeSortComparator();
-    filtered.sort((a, b) => {
-      // Shared folders first, then own folders, then ZIP files.
-      const aShared = !!a._shared, bShared = !!b._shared;
-      if (aShared !== bShared) return aShared ? -1 : 1;
-      if (isFolder(a) !== isFolder(b)) return isFolder(a) ? -1 : 1;
-      return cmp(a, b);
-    });
-    state.currentFiles = filtered;
-    renderFileList(filtered);
+
+    const sortAndRender = () => {
+      const cmp = makeSortComparator();
+      filtered.sort((a, b) => {
+        const aShared = !!a._shared, bShared = !!b._shared;
+        if (aShared !== bShared) return aShared ? -1 : 1;
+        if (isFolder(a) !== isFolder(b)) return isFolder(a) ? -1 : 1;
+        return cmp(a, b);
+      });
+      state.currentFiles = filtered;
+      renderFileList(filtered);
+    };
+    sortAndRender();
+
+    // STEP 2: in the background, refresh peek data for folders that are
+    // either missing from the cache or stale. Re-sort and re-render when
+    // meaningful updates land. This is async and doesn't block the user.
+    if (needsPeek) {
+      backgroundRefreshFolderPeeks(filtered, token, sortAndRender);
+    }
   } catch (e) {
+    if (token !== state._folderLoadToken) return;
     $('file-list').innerHTML = `<div class="empty-state">Error: ${escapeHtml(e.message)}</div>`;
   }
+}
+
+// Refresh folder peek timestamps in the background. Only folders without
+// a fresh cache entry are actually fetched; the rest reuse the IndexedDB
+// hydrated value applied during the initial render. The provided callback
+// re-renders the list once a meaningful number of updates have landed
+// (batched so we don't thrash the DOM on every single peek).
+function backgroundRefreshFolderPeeks(files, token, onUpdate) {
+  const folders = files.filter(isFolder);
+  if (!folders.length) return;
+  // Decide which folders need a fresh peek.
+  const stale = [];
+  for (const f of folders) {
+    // We need a peek if: not in memory cache, OR cache is missing TS.
+    // We do NOT re-peek every time — the IndexedDB hydration above
+    // populates _folderPeekCache with persisted values. Only folders we
+    // truly haven't seen, or whose IndexedDB entry is older than TTL,
+    // need a fresh Drive RTT. The TTL check happens via IndexedDB
+    // metadata, fetched alongside the hydration.
+    if (!_folderPeekCache.has(f.id)) stale.push(f);
+  }
+  // Also schedule TTL-expired refreshes (async — they don't block first
+  // render). We check the IndexedDB fetchedAt timestamp for each cached
+  // folder; if older than TTL, queue a refresh.
+  Promise.resolve().then(async () => {
+    for (const f of folders) {
+      if (stale.includes(f)) continue;
+      const cached = await getCachedFolderPeek(f.id);
+      if (cached && Date.now() - (cached.fetchedAt || 0) > FOLDER_PEEK_TTL_MS) {
+        stale.push(f);
+        _folderPeekCache.delete(f.id);  // force re-peek
+      }
+    }
+    if (token !== state._folderLoadToken) return;
+    // Now run the actual peeks in parallel.
+    let updatesSinceRender = 0;
+    let firstUpdate = true;
+    let renderTimer = null;
+    const scheduleRender = () => {
+      if (renderTimer) return;
+      renderTimer = setTimeout(() => {
+        renderTimer = null;
+        if (token !== state._folderLoadToken) return;
+        if (updatesSinceRender === 0) return;
+        updatesSinceRender = 0;
+        onUpdate();
+      }, firstUpdate ? 100 : 400);
+      firstUpdate = false;
+    };
+    await Promise.all(stale.map(async f => {
+      const ts = await peekFolderModified(f.id);
+      if (token !== state._folderLoadToken) return;
+      if (ts && ts !== f._effectiveModifiedTime) {
+        f._effectiveModifiedTime = ts;
+        updatesSinceRender++;
+        scheduleRender();
+      }
+    }));
+    // Final render to catch any trailing updates.
+    if (updatesSinceRender > 0 && token === state._folderLoadToken) {
+      if (renderTimer) clearTimeout(renderTimer);
+      onUpdate();
+    }
+  });
 }
 
 async function runSearch(query) {
