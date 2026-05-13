@@ -4255,16 +4255,34 @@ async function autoSignIn() {
   }
   // Override callback so a silent failure does not toast — that's expected.
   const origCb = state.tokenClient.callback;
+  let settled = false;
+  const settle = () => {
+    if (settled) return;
+    settled = true;
+    state.tokenClient.callback = origCb;
+  };
   state.tokenClient.callback = (resp) => {
+    settle();
     if (resp.error) {
-      // Silent attempt failed. Restore default callback and show the form.
-      state.tokenClient.callback = origCb;
+      // Silent attempt failed. Show the form so the user can sign in manually.
       showAutoSignInState(false);
       return;
     }
     origCb(resp);
   };
   state.tokenClient.requestAccessToken({ prompt: '' });
+  // CRITICAL: GIS does NOT always fire the callback. If the user has no
+  // valid Google session, or there's a network/cookie issue, the silent
+  // attempt may just hang. Without this timeout, the user is stuck staring
+  // at the "Signing in..." spinner forever, unable to access the form or
+  // the manual sign-in button. After 5 seconds, give up and show the form.
+  setTimeout(() => {
+    if (settled) return;
+    settle();
+    if (!$('auto-signin-status').classList.contains('hidden')) {
+      showAutoSignInState(false);
+    }
+  }, 5000);
 }
 
 function wireBrowser() {
@@ -4596,14 +4614,26 @@ window.addEventListener('DOMContentLoaded', () => {
   // want the user staring at a half-rendered black screen. This handler
   // forces the sign-in form back into view and dismisses the loading
   // spinner. The user can then click Sign In (or clear data) to retry.
+  //
+  // CRITICAL: only intervene if the user is still on the signin screen.
+  // If they have already navigated to the browser or reader, a stray
+  // background error (e.g. an aborted fetch, an image decode hiccup, a
+  // transient Drive 429) must NOT bounce them back to signin — that
+  // destroys their in-progress work and looks like an auth failure.
   const recover = (label) => (ev) => {
     const err = ev && (ev.error || ev.reason || ev.message) || '(unknown)';
     console.error('[startup recovery]', label, err);
+    const ss = document.getElementById('signin-screen');
+    if (!ss) return;
+    // If the user has already moved past signin, leave them alone.
+    if (ss.classList.contains('hidden')) {
+      console.warn('[startup recovery] ignored — user is past signin');
+      return;
+    }
     try {
-      const ss = document.getElementById('signin-screen');
       const bs = document.getElementById('browser-screen');
       const rs = document.getElementById('reader-screen');
-      if (ss) ss.classList.remove('hidden');
+      ss.classList.remove('hidden');
       if (bs) bs.classList.add('hidden');
       if (rs) rs.classList.add('hidden');
       const sf = document.getElementById('signin-form');
