@@ -1733,26 +1733,25 @@ async function refreshProgress() {
   }
 }
 
-// When the page becomes visible again (user returns to the tab/app),
-// pull the latest progress from Drive so we pick up reading done on
-// another device. When it becomes HIDDEN (screen off, app switch, tab
-// background), flush our progress to Drive immediately via keepalive —
-// this is the critical path for cross-device sync on mobile, where the
-// device may sleep moments after the last page turn and never fire a
-// proper unload event.
-document.addEventListener('visibilitychange', () => {
-  if (document.hidden) {
-    // Page going to background — save NOW, reliably.
-    flushProgressKeepalive();
-    return;
-  }
-  // Page coming to foreground — refresh from cloud.
+// Pull the latest progress from Drive and react appropriately. Called when
+// the page returns to the foreground via ANY of several browser events
+// (visibilitychange, window focus, pageshow). Desktop browsers in
+// particular are inconsistent about which event fires when returning from
+// another tab/window or a display sleep, so we listen to all of them and
+// debounce to avoid redundant network calls.
+let _lastForegroundSync = 0;
+function syncOnForeground() {
   if (!state.accessToken || !state.progressFileId) return;
+  // Debounce: if several events fire in quick succession (e.g. focus +
+  // visibilitychange together), only run once per second.
+  const now = Date.now();
+  if (now - _lastForegroundSync < 1000) return;
+  _lastForegroundSync = now;
 
   // CASE 1: a reader is open. The user may have read further on another
-  // device while this one was backgrounded (e.g. tablet left open on a
-  // page, then PC reads ahead). Pull the latest progress and re-seek the
-  // open book if the cloud has a newer page for it.
+  // device while this one was backgrounded (e.g. PC tab left open on a
+  // page, then phone reads ahead). Pull the latest progress and re-seek
+  // the open book if the cloud has a newer page for it.
   if (state.reader && !$('reader-screen').classList.contains('hidden')) {
     const targetId = state.reader.file.id;
     const before = state.progress.files[targetId];
@@ -1762,15 +1761,15 @@ document.addEventListener('visibilitychange', () => {
       if (!state.reader || state.reader.file.id !== targetId) return;
       const after = state.progress.files[targetId];
       if (!after || after.page == null) return;
-      // Only jump if the cloud genuinely had a newer record AND it points
-      // to a different page than where we currently are. This avoids
-      // yanking the user when nothing changed elsewhere.
-      if ((after.updated || 0) > beforeUpdated && after.page !== beforePage) {
-        // Guard: don't fight the user if they've already paged somewhere
-        // since the snapshot. Compare against the reader's CURRENT page.
-        const slot = state.reader.slots[state.reader.currentSlotIndex];
-        const curPage = slot ? state.reader._realPage(slot[0]) : null;
-        if (curPage === after.page) return;  // already there
+      // Where is the reader actually sitting right now?
+      const slot = state.reader.slots[state.reader.currentSlotIndex];
+      const curPage = slot ? state.reader._realPage(slot[0]) : null;
+      if (curPage === after.page) return;  // already there, nothing to do
+      // Jump if the cloud record is newer than what we had before the
+      // refresh, OR (defensively) if the cloud simply points somewhere
+      // different and is at least as new — covers clock-skew edge cases
+      // where the timestamps are very close.
+      if ((after.updated || 0) >= beforeUpdated && after.page !== curPage) {
         state.reader.jumpToPage(after.page + 1);
         toast(`他のデバイスの続きに同期 (${after.page + 1}ページ)`, 2000);
       }
@@ -1787,6 +1786,44 @@ document.addEventListener('visibilitychange', () => {
       else renderFileList(state.currentFiles);
     });
   }
+}
+
+// When the page becomes visible again (user returns to the tab/app),
+// pull the latest progress from Drive so we pick up reading done on
+// another device. When it becomes HIDDEN (screen off, app switch, tab
+// background), flush our progress to Drive immediately via keepalive —
+// this is the critical path for cross-device sync on mobile, where the
+// device may sleep moments after the last page turn and never fire a
+// proper unload event.
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    // Page going to background — save NOW, reliably.
+    flushProgressKeepalive();
+    return;
+  }
+  syncOnForeground();
+});
+
+// Desktop browsers often DON'T fire visibilitychange when you switch to
+// another window/app (the tab is still "visible" in its own window) or
+// when returning from a display sleep. The window focus event is more
+// reliable for those cases. We also flush on blur as a save opportunity.
+window.addEventListener('focus', () => {
+  syncOnForeground();
+});
+window.addEventListener('blur', () => {
+  // Losing focus is a good moment to persist — desktop user may be
+  // switching to another device. Use keepalive in case the tab is later
+  // discarded without another event.
+  flushProgressKeepalive();
+});
+
+// pageshow fires when navigating back to the page, including restores
+// from the back/forward cache (where load/DOMContentLoaded won't fire).
+window.addEventListener('pageshow', (e) => {
+  // persisted === true means restored from bfcache — definitely need a
+  // fresh sync since our in-memory state may be stale.
+  syncOnForeground();
 });
 
 // pagehide fires when the page is being unloaded OR put into the back/
