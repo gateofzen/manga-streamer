@@ -1050,22 +1050,49 @@ let _tokenRefreshPromise = null;
 // read hit the buffer and return without any further network at all.
 //
 // Caps:
-//   P0 (foreground page loads + instant prefetch wave): up to 2 slots
+//   P0 (foreground page loads + instant prefetch wave): up to 4 slots
 //   P1 (thumbnails):                                     up to 2 slots
 //   P2 (forward prefetch wave):                          up to 1 slot
 //   P3 (background fill):                                up to 1 slot
 //   Total cap:                                           4
+//
+// IMPORTANT — foreground reservation: lower-priority requests (thumbnails,
+// prefetch, background fill) are only granted when doing so still leaves
+// FOREGROUND_RESERVE slots free for P0 to grab instantly. Without this,
+// opening the thumbnail strip floods the gate with P1 thumbnail fetches
+// that consume every slot, halving (or worse) the bandwidth available to
+// the page the user is actually looking at — exactly the 2–3 s page loads
+// seen in the logs. With the reservation, foreground page reads can always
+// claim 2 slots immediately even while dozens of thumbnails are queued.
 const DRIVE_PRIORITY_LEVELS = 4;
 const DRIVE_TOTAL_CAP = 4;
-const DRIVE_PRIORITY_CAPS = [2, 2, 1, 1];
+const DRIVE_PRIORITY_CAPS = [4, 2, 1, 1];
+// How many gate slots to keep available for foreground (P0) when deciding
+// whether to admit a lower-priority (P1+) request.
+const FOREGROUND_RESERVE = 2;
 
 let _driveActive = 0;
 const _driveActiveByPriority = [0, 0, 0, 0];
 const _driveWaitQueues = Array.from({ length: DRIVE_PRIORITY_LEVELS }, () => []);
 
 function _driveCanGrant(p) {
-  return _driveActive < DRIVE_TOTAL_CAP
-      && _driveActiveByPriority[p] < DRIVE_PRIORITY_CAPS[p];
+  if (_driveActive >= DRIVE_TOTAL_CAP) return false;
+  if (_driveActiveByPriority[p] >= DRIVE_PRIORITY_CAPS[p]) return false;
+  // Foreground (P0) may use any free slot. Lower priorities must leave
+  // FOREGROUND_RESERVE slots free so a foreground read can start instantly.
+  if (p > 0) {
+    const freeAfter = DRIVE_TOTAL_CAP - _driveActive - 1;
+    if (freeAfter < FOREGROUND_RESERVE) {
+      // Granting this P1+ request would eat into the foreground reserve.
+      // Allow it ONLY if there are currently no foreground requests active
+      // (so we don't idle slots when nobody's reading a page) AND no P0
+      // waiters are queued.
+      if (_driveActiveByPriority[0] > 0 || _driveWaitQueues[0].length > 0) {
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 function _driveAcquire(priority = 1) {
@@ -1084,7 +1111,7 @@ function _driveAcquire(priority = 1) {
 function _driveRelease(p) {
   _driveActive--;
   _driveActiveByPriority[p]--;
-  // Wake the highest-priority waiter that has capacity for. Scan from P0
+  // Wake the highest-priority waiter that has capacity. Scan from P0
   // down — if P0 can be granted, do it; else try P1, etc.
   for (let pp = 0; pp < DRIVE_PRIORITY_LEVELS; pp++) {
     const q = _driveWaitQueues[pp];
@@ -1158,7 +1185,6 @@ function signOut() {
 //===========================================================================
 async function driveFetch(url, init = {}) {
   const tag = '[driveFetch ' + Math.random().toString(36).substring(2, 7) + ']';
-  console.log(tag, 'enter', url.substring(0, 80));
   const p = await _driveAcquire(init.priority);
   try {
     return await _driveFetchInner(url, init, tag);
@@ -1169,7 +1195,6 @@ async function driveFetch(url, init = {}) {
 
 async function _driveFetchInner(url, init, tag) {
   await ensureToken();
-  console.log(tag, 'token ready');
   // Drive sometimes intentionally slow-responds when the user has many
   // requests in flight. 45s gives genuine slow responses time to land
   // before we abort. The hard fetchRange-level timeout still catches true
@@ -1209,9 +1234,7 @@ async function _driveFetchInner(url, init, tag) {
 
   const doFetch = async (hdrs) => {
     try {
-      console.log(tag, 'fetch starting');
       const r = await fetch(url, Object.assign({}, fetchInit, { headers: hdrs }));
-      console.log(tag, 'fetch resolved, status=', r.status);
       return r;
     } catch (err) {
       console.warn(tag, 'fetch threw:', err.name, err.message);
@@ -1228,7 +1251,6 @@ async function _driveFetchInner(url, init, tag) {
     attempt++;
     resp = await doFetch(headers);
     if (resp.status === 401 && attempt === 1) {
-      console.log(tag, '401, refreshing token');
       state.accessToken = null;
       await ensureToken();
       headers.Authorization = 'Bearer ' + state.accessToken;
@@ -1245,7 +1267,6 @@ async function _driveFetchInner(url, init, tag) {
     break;
   }
   resp._timeoutCleanup = () => {
-    console.log(tag, 'timeout cleanup called');
     clearTimeout(timeoutId);
   };
   resp._abortSignal = signal;
@@ -1368,7 +1389,6 @@ async function getFileSize(fileId) {
 async function fetchRange(fileId, start, end, signal = null, priority = 1) {
   const tag = `[fetchRange ${start}-${end}]`;
   const t0 = Date.now();
-  console.log(tag, 'enter');
   const url = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&supportsAllDrives=true`;
 
   // Hard JavaScript-level timeout that bypasses anything that might be wrong
@@ -1395,9 +1415,7 @@ async function fetchRange(fileId, start, end, signal = null, priority = 1) {
       if (resp._timeoutCleanup) resp._timeoutCleanup();
       throw new Error('Drive range fetch failed: ' + resp.status);
     }
-    console.log(tag, 'headers ok, reading body...');
     const ab = await readBodyArrayBuffer(resp);
-    console.log(tag, 'done', Date.now()-t0, 'ms,', ab.byteLength, 'bytes');
     return new Uint8Array(ab);
   })();
 
@@ -1457,7 +1475,6 @@ async function createProgressFile(content) {
 }
 
 async function updateProgressFile(fileId, content) {
-  console.log('[updateProgressFile] PATCH starting');
   const HARD_TIMEOUT_MS = 15000;
   let hardTimeoutId;
   const hardTimeout = new Promise((_, reject) => {
@@ -1475,7 +1492,6 @@ async function updateProgressFile(fileId, content) {
         body: JSON.stringify(content),
       }
     );
-    console.log('[updateProgressFile] response received, status=', resp.status);
     // PATCH returns a JSON body — must drain it for the timeout to clear.
     // Previously we just looked at resp.status and called _timeoutCleanup
     // without reading the body, which on some browsers leaves the connection
@@ -1487,7 +1503,6 @@ async function updateProgressFile(fileId, content) {
       console.warn('[updateProgressFile] body parse failed (non-fatal):', e.message);
     }
     if (!resp.ok) throw new Error('AppData update failed: ' + resp.status);
-    console.log('[updateProgressFile] DONE');
   })();
   try {
     await Promise.race([work, hardTimeout]);
@@ -1660,15 +1675,12 @@ async function flushProgressSave() {
 // under (a few hundred bytes per book).
 function flushProgressKeepalive() {
   if (!state.progressFileId || !state.accessToken) {
-    console.log('[keepalive] skipped — no progressFileId or token');
     return;
   }
   // Cancel the pending debounced save — we're saving right now.
   if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
   try {
     const body = JSON.stringify(state.progress);
-    console.log('[keepalive] PATCHing progress, body length=', body.length,
-      '| files=', Object.keys(state.progress.files || {}).length);
     // Guard against the 64 KB keepalive cap — fall back to the normal
     // (non-keepalive) flush which has no size limit.
     if (body.length > 60 * 1024) {
@@ -1697,8 +1709,6 @@ async function refreshProgress() {
   showSync(true);
   try {
     const data = await readProgressFile(state.progressFileId);
-    console.log('[refreshProgress] cloud data files=',
-      data && data.files ? Object.keys(data.files).length : 0);
     if (data && data.files) {
       // MERGE rather than overwrite. For each book, keep whichever record
       // has the newer `updated` timestamp. This protects progress made on
@@ -1747,17 +1757,13 @@ async function refreshProgress() {
 // debounce to avoid redundant network calls.
 let _lastForegroundSync = 0;
 function syncOnForeground(trigger) {
-  console.log('[sync] syncOnForeground triggered by:', trigger,
-    '| hasToken=', !!state.accessToken, '| progressFileId=', state.progressFileId);
   if (!state.accessToken || !state.progressFileId) {
-    console.log('[sync] skipped — no token or no progress file');
     return;
   }
   // Debounce: if several events fire in quick succession (e.g. focus +
   // visibilitychange together), only run once per second.
   const now = Date.now();
   if (now - _lastForegroundSync < 1000) {
-    console.log('[sync] skipped — debounced (', now - _lastForegroundSync, 'ms since last)');
     return;
   }
   _lastForegroundSync = now;
@@ -1771,38 +1777,27 @@ function syncOnForeground(trigger) {
     const before = state.progress.files[targetId];
     const beforePage = before ? before.page : null;
     const beforeUpdated = before ? (before.updated || 0) : 0;
-    console.log('[sync] reader open for', targetId,
-      '| localBefore page=', beforePage, 'updated=', beforeUpdated);
     refreshProgress().then(() => {
       if (!state.reader || state.reader.file.id !== targetId) {
-        console.log('[sync] reader changed during refresh, aborting');
         return;
       }
       const after = state.progress.files[targetId];
-      console.log('[sync] after refresh:', after);
       if (!after || after.page == null) {
-        console.log('[sync] no usable cloud record');
         return;
       }
       // Where is the reader actually sitting right now?
       const slot = state.reader.slots[state.reader.currentSlotIndex];
       const curPage = slot ? state.reader._realPage(slot[0]) : null;
-      console.log('[sync] reader currently on page', curPage,
-        '| cloud says page', after.page, 'updated', after.updated);
       if (curPage === after.page) {
-        console.log('[sync] already on cloud page, nothing to do');
         return;
       }
       // Jump if the cloud record is newer than what we had before the
       // refresh, OR (defensively) if the cloud simply points somewhere
       // different and is at least as new — covers clock-skew edge cases.
       if ((after.updated || 0) >= beforeUpdated && after.page !== curPage) {
-        console.log('[sync] JUMPING to page', after.page + 1);
         state.reader.jumpToPage(after.page + 1);
         toast(`他のデバイスの続きに同期 (${after.page + 1}ページ)`, 2000);
       } else {
-        console.log('[sync] NOT jumping — cloud not newer (cloud',
-          after.updated, 'vs before', beforeUpdated, ')');
       }
     }).catch(e => console.warn('[sync] refresh failed:', e));
     return;
@@ -1810,7 +1805,6 @@ function syncOnForeground(trigger) {
 
   // CASE 2: the file browser is showing — refresh and re-render the list
   // so progress tags reflect reading done elsewhere.
-  console.log('[sync] no reader open, refreshing browser list');
   if (!$('browser-screen').classList.contains('hidden')) {
     refreshProgress().then(() => {
       if (state.history) renderHistory();
@@ -1830,7 +1824,6 @@ function syncOnForeground(trigger) {
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
     // Page going to background — save NOW, reliably.
-    console.log('[sync] visibilitychange → HIDDEN, flushing');
     flushProgressKeepalive();
     return;
   }
@@ -1848,7 +1841,6 @@ window.addEventListener('blur', () => {
   // Losing focus is a good moment to persist — desktop user may be
   // switching to another device. Use keepalive in case the tab is later
   // discarded without another event.
-  console.log('[sync] window blur, flushing');
   flushProgressKeepalive();
 });
 
@@ -2586,7 +2578,6 @@ function _pickNextVolume(candidates, parsedCurrent) {
 
 async function findNextVolumeInDrive(currentFile) {
   const parsed = parseSeriesAndVolume(currentFile.name);
-  console.log('[next-volume] parsed current:', currentFile.name, '→', parsed);
   if (!parsed) return null;
 
   // Try two Drive search keywords. The first (cleaned full series name) is
@@ -2627,7 +2618,6 @@ async function findNextVolumeInDrive(currentFile) {
         listFolder(pid).catch(() => [])
       ));
       const flat = lists.flat();
-      console.log('[next-volume] parent folder siblings:', flat.length);
       return flat;
     } catch (e) {
       console.warn('[next-volume] parent folder list failed:', e);
@@ -2639,7 +2629,6 @@ async function findNextVolumeInDrive(currentFile) {
   const searchPromises = queries.map(async q => {
     try {
       const r = await searchDrive(q);
-      console.log('[next-volume] search', JSON.stringify(q), '→', r.length, 'results');
       return r;
     } catch (e) {
       console.warn('[next-volume] search failed for', q, e);
@@ -2667,10 +2656,8 @@ async function findNextVolumeInDrive(currentFile) {
   addAll(parentSiblings);
   for (const list of searchResults) addAll(list);
   const candidates = [...byId.values()];
-  console.log('[next-volume] total unique candidates:', candidates.length);
 
   const picked = _pickNextVolume(candidates, parsed);
-  console.log('[next-volume] picked:', picked ? picked.name : '(none)');
   return picked;
 }
 const ZIP_EXT = /\.(zip|cbz)$/i;
@@ -3131,16 +3118,12 @@ class Reader {
       if (parsed) {
         const others = seriesCtx.siblings.filter(f => f.id !== file.id);
         this.nextFile = _pickNextVolume(others, parsed);
-        console.log('[Reader.ctor] sibling pick from folder for', file.name,
-                    '→', this.nextFile ? this.nextFile.name : '(none in folder)');
       } else if (seriesCtx.index >= 0 && seriesCtx.index + 1 < seriesCtx.siblings.length) {
         // Couldn't parse a volume — fall back to "next sibling in list order"
         // as a best-effort guess. Drive-wide search will be skipped because
         // we have a candidate, but if this is wrong the user just won't see
         // it auto-advance to the right thing — no worse than before.
         this.nextFile = seriesCtx.siblings[seriesCtx.index + 1];
-        console.log('[Reader.ctor] unparseable name, falling back to next-in-list:',
-                    this.nextFile && this.nextFile.name);
       }
     }
     // Always run a Drive-wide search in the background. Even when we picked
@@ -3175,8 +3158,6 @@ class Reader {
 
   async start() {
     const tag = `[Reader.start ${this.file.name}]`;
-    console.log(tag, 'BEGIN');
-    console.log(tag, 'reader-pages currently has', $('reader-pages').children.length, 'children');
 
     // Cancel any thumbnail fetches still in flight from the file list. They
     // were started speculatively while the user browsed; now that the user
@@ -3187,7 +3168,6 @@ class Reader {
     // file list (and most are cached after the first successful load).
     const cancelled = _thumbAbortControllers.size;
     if (cancelled > 0) {
-      console.log(tag, 'cancelling', cancelled, 'in-flight thumbnail loads');
       cancelAllThumbnailLoads();
     }
 
@@ -3205,19 +3185,14 @@ class Reader {
     showScreen('reader-screen');
 
     try {
-      console.log(tag, 'getting file size...');
       const size = parseInt(this.file.size, 10) || await getFileSize(this.file.id);
-      console.log(tag, 'size=', size);
-      if (this.cancelled) { console.log(tag, 'cancelled before zip.open'); return; }
+      if (this.cancelled) { return; }
       this.zip = new ZipReader(this.file.id, size);
-      console.log(tag, 'calling zip.open...');
       await this.zip.open();
-      console.log(tag, 'zip.open done, entries:', this.zip.entries.length);
-      if (this.cancelled) { console.log(tag, 'cancelled after zip.open'); return; }
+      if (this.cancelled) { return; }
       this.imageEntries = this.zip.entries
         .filter(e => IMAGE_EXT.test(e.name))
         .sort((a, b) => naturalCompare(a.name, b.name));
-      console.log(tag, 'imageEntries:', this.imageEntries.length);
 
       if (!this.imageEntries.length) {
         $('reader-pages').innerHTML =
@@ -3226,7 +3201,6 @@ class Reader {
       }
 
       this.buildSlots();
-      console.log(tag, 'slots built:', this.slots.length);
 
       const savedPage = getProgress(this.file.id);
       const startPage = (savedPage != null && savedPage < this.imageEntries.length) ? savedPage : 0;
@@ -3248,7 +3222,6 @@ class Reader {
       // thumbnails both benefit because both read from the same buffer.
       this._fireInitialPrefetch(startPage);
 
-      console.log(tag, 'calling renderSlots');
       this.renderSlots();
       // Build the thumbnail strip alongside the page DOM. Done synchronously
       // because it's just placeholder DOM — image bitmaps populate as pages
@@ -3268,7 +3241,6 @@ class Reader {
       if (this.nextSearchPending) {
         this.searchNextVolume();
       }
-      console.log(tag, 'END');
     } catch (e) {
       console.error(tag, 'FAILED:', e);
       $('reader-pages').innerHTML =
@@ -3290,13 +3262,10 @@ class Reader {
         const oldP = parseSeriesAndVolume(this.nextFile.name);
         const newP = parseSeriesAndVolume(found.name);
         if (oldP && newP && newP.volume >= oldP.volume) {
-          console.log('[next-volume] keeping in-folder pick (vol',
-                      oldP.volume, ') over Drive pick (vol', newP.volume, ')');
           return;
         }
       }
 
-      console.log('[next-volume] adopting Drive-wide result:', found.name);
       this.nextFile = found;
       // Re-render only the sentinel slot so the new info appears without
       // disturbing the reading position.
@@ -3594,7 +3563,6 @@ class Reader {
 
   renderSlots() {
     const container = $('reader-pages');
-    console.log('[renderSlots] building', this.slots.length, 'slots, current=', this.currentSlotIndex);
     // Guard against the implicit scroll-to-0 that innerHTML triggers. The
     // following scrollToSlot() will reset this flag once it's done.
     this._programmaticScroll = true;
@@ -3771,7 +3739,6 @@ class Reader {
   // save can't be forgotten by one of the call sites.
   _settleSlot() {
     if (this.cancelled) return;
-    console.log('[_settleSlot] currentSlotIndex=', this.currentSlotIndex);
     this.updateCounter();
     this.updateThumbStripCurrent();
     this.preload();
@@ -3822,7 +3789,6 @@ class Reader {
     for (let i = 1; i <= FORWARD; i++) addSlot(this.currentSlotIndex + i);
     for (let i = 1; i <= BACKWARD; i++) addSlot(this.currentSlotIndex - i);
 
-    console.log('[preload] ordered pages=', orderedPages);
 
     // CRITICAL: Abort in-flight loads whose pages are no longer in the
     // preload window. Without this, when the user scrolls fast, the four
@@ -3833,7 +3799,6 @@ class Reader {
     if (this._inflightAborts) {
       for (const [page, ctl] of this._inflightAborts) {
         if (!wantedSet.has(page)) {
-          console.log(`[preload] aborting stale loadPage ${page}`);
           ctl.abort();
           this._inflightAborts.delete(page);
         }
@@ -3883,15 +3848,12 @@ class Reader {
       this.bitmapCache.delete(pageIndex);
       this.bitmapCache.set(pageIndex, url);
       this.attachImage(pageIndex, url);
-      console.log(`[loadPage ${pageIndex}] cache hit`);
       return;
     }
     if (this.loading.has(pageIndex)) {
-      console.log(`[loadPage ${pageIndex}] already loading, returning existing promise`);
       return this.loading.get(pageIndex);
     }
 
-    console.log(`[loadPage ${pageIndex}] starting fetch`);
     const startTime = Date.now();
 
     // AbortController for this fetch — preload() will call ctl.abort() when
@@ -3907,26 +3869,20 @@ class Reader {
     const p = (async () => {
       try {
         const entry = this.imageEntries[pageIndex];
-        console.log(`[loadPage ${pageIndex}] entry:`, entry.name, 'compSize:', entry.compSize);
         let bytes;
         try {
-          console.log(`[loadPage ${pageIndex}] readEntry attempt 1`);
           // Priority 0 = foreground reader page. Always jumps the line
           // ahead of thumbnail/prefetch/background-fill work.
           bytes = await this.zip.readEntry(entry, ctl.signal, 0);
-          console.log(`[loadPage ${pageIndex}] readEntry success, ${bytes.length} bytes, ${Date.now()-startTime}ms`);
         } catch (err1) {
           if (isAborted()) {
-            console.log(`[loadPage ${pageIndex}] aborted during attempt 1`);
             return;
           }
           console.warn(`[loadPage ${pageIndex}] attempt 1 failed:`, err1.message);
           if (this.cancelled) return;
           await new Promise(r => setTimeout(r, 400));
           if (this.cancelled || isAborted()) return;
-          console.log(`[loadPage ${pageIndex}] readEntry attempt 2`);
           bytes = await this.zip.readEntry(entry, ctl.signal, 0);
-          console.log(`[loadPage ${pageIndex}] readEntry retry success`);
         }
         if (this.cancelled || isAborted()) return;
         const ext = entry.name.split('.').pop().toLowerCase();
@@ -3940,13 +3896,11 @@ class Reader {
         this.bitmapCache.set(pageIndex, url);
         this.evictCache();
         this.attachImage(pageIndex, url);
-        console.log(`[loadPage ${pageIndex}] DONE (${Date.now()-startTime}ms)`);
       } catch (e) {
         // Aborted loads should bail silently — they didn't truly fail, the
         // user just scrolled past. Showing a "load failed" UI for them
         // would be wrong (and they'll be re-fetched if scrolled back to).
         if (isAborted()) {
-          console.log(`[loadPage ${pageIndex}] aborted (silent bail)`);
           return;
         }
         console.error(`[loadPage ${pageIndex}] FAILED after ${Date.now()-startTime}ms:`, e);
