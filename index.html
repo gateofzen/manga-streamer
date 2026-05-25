@@ -1600,7 +1600,11 @@ function setProgress(fileId, page, meta) {
 
 function scheduleProgressSave() {
   if (saveTimer) clearTimeout(saveTimer);
-  saveTimer = setTimeout(flushProgressSave, 3000);
+  // Shortened from 3000ms. On mobile, the gap between the last page turn
+  // and the screen turning off can be very short, so we want progress
+  // committed to Drive quickly. 1.2s still coalesces rapid page-flips
+  // into a single network write.
+  saveTimer = setTimeout(flushProgressSave, 1200);
 }
 
 async function flushProgressSave() {
@@ -1621,14 +1625,84 @@ async function flushProgressSave() {
   return savePromise;
 }
 
+// Flush progress using a keepalive fetch. Unlike a normal fetch, a
+// keepalive request is allowed to outlive the page — the browser keeps
+// the connection open and completes the request even if the document is
+// being unloaded or backgrounded. This is the ONLY reliable way to save
+// state when a mobile device's screen turns off or the user switches
+// apps, because:
+//   - beforeunload often doesn't fire on mobile at all
+//   - a normal async fetch started in visibilitychange/pagehide gets
+//     killed when the page is frozen/discarded before it completes
+// keepalive has a 64 KB body limit, which our progress JSON stays well
+// under (a few hundred bytes per book).
+function flushProgressKeepalive() {
+  if (!state.progressFileId || !state.accessToken) return;
+  // Cancel the pending debounced save — we're saving right now.
+  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+  try {
+    const body = JSON.stringify(state.progress);
+    // Guard against the 64 KB keepalive cap. Progress JSON is tiny, but
+    // if a user somehow has thousands of books, fall back to the normal
+    // (non-keepalive) flush which has no size limit.
+    if (body.length > 60 * 1024) {
+      flushProgressSave();
+      return;
+    }
+    fetch(
+      `https://www.googleapis.com/upload/drive/v3/files/${state.progressFileId}?uploadType=media`,
+      {
+        method: 'PATCH',
+        headers: {
+          'Authorization': 'Bearer ' + state.accessToken,
+          'Content-Type': 'application/json; charset=UTF-8',
+        },
+        body,
+        keepalive: true,
+      }
+    ).catch(() => {});  // fire-and-forget; nothing to await on unload
+  } catch (e) {
+    console.warn('[keepalive flush] failed:', e);
+  }
+}
+
 async function refreshProgress() {
   if (!state.progressFileId) return;
   showSync(true);
   try {
     const data = await readProgressFile(state.progressFileId);
     if (data && data.files) {
-      state.progress = data;
+      // MERGE rather than overwrite. For each book, keep whichever record
+      // has the newer `updated` timestamp. This protects progress made on
+      // THIS device that hasn't been flushed to Drive yet (e.g. a keepalive
+      // save that failed because the token had expired) from being clobbered
+      // by an older cloud value when we come back to the foreground.
+      const localFiles = state.progress.files || {};
+      const cloudFiles = data.files || {};
+      const mergedFiles = {};
+      const allIds = new Set([
+        ...Object.keys(localFiles),
+        ...Object.keys(cloudFiles),
+      ]);
+      let localHadNewer = false;
+      for (const id of allIds) {
+        const local = localFiles[id];
+        const cloud = cloudFiles[id];
+        if (!cloud) { mergedFiles[id] = local; localHadNewer = true; continue; }
+        if (!local) { mergedFiles[id] = cloud; continue; }
+        // Both exist — take the newer by `updated`.
+        if ((local.updated || 0) > (cloud.updated || 0)) {
+          mergedFiles[id] = local;
+          localHadNewer = true;
+        } else {
+          mergedFiles[id] = cloud;
+        }
+      }
+      state.progress = { version: data.version || 1, files: mergedFiles };
       saveLocalMirror();
+      // If our local state contributed newer records, push the merged
+      // result back to the cloud so the other device sees them too.
+      if (localHadNewer) scheduleProgressSave();
     }
   } catch (e) {
     console.warn('Progress refresh failed:', e);
@@ -1637,8 +1711,20 @@ async function refreshProgress() {
   }
 }
 
+// When the page becomes visible again (user returns to the tab/app),
+// pull the latest progress from Drive so we pick up reading done on
+// another device. When it becomes HIDDEN (screen off, app switch, tab
+// background), flush our progress to Drive immediately via keepalive —
+// this is the critical path for cross-device sync on mobile, where the
+// device may sleep moments after the last page turn and never fire a
+// proper unload event.
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden) return;
+  if (document.hidden) {
+    // Page going to background — save NOW, reliably.
+    flushProgressKeepalive();
+    return;
+  }
+  // Page coming to foreground — refresh from cloud.
   if (!state.accessToken || !state.progressFileId) return;
   if (!$('browser-screen').classList.contains('hidden')) {
     refreshProgress().then(() => {
@@ -1649,8 +1735,22 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 
+// pagehide fires when the page is being unloaded OR put into the back/
+// forward cache. On mobile this is more reliable than beforeunload. Use
+// keepalive so the request survives the page going away.
+window.addEventListener('pagehide', () => {
+  flushProgressKeepalive();
+});
+
+// freeze fires when the browser is about to freeze a backgrounded page
+// (mobile memory pressure). Last chance to persist state.
+document.addEventListener('freeze', () => {
+  flushProgressKeepalive();
+});
+
+// beforeunload as a final fallback for desktop browsers.
 window.addEventListener('beforeunload', () => {
-  if (saveTimer) flushProgressSave();
+  flushProgressKeepalive();
 });
 
 //===========================================================================
@@ -4342,6 +4442,34 @@ function openZip(file, seriesCtx) {
   if (state.reader) state.reader.destroy();
   state.reader = new Reader(file, seriesCtx);
   state.reader.start();
+  // Kick off a cloud progress refresh in the background. If another device
+  // advanced this book further than our local state knows, re-seek to the
+  // newer page once it lands. This covers the case where the user was
+  // reading on device A (screen turned off → keepalive saved to Drive),
+  // then opens the same book on device B whose in-memory state predates
+  // that save. The reader opens instantly at the locally-known page, then
+  // jumps forward if the cloud has newer progress.
+  if (state.progressFileId) {
+    const targetId = file.id;
+    const localBefore = state.progress.files[targetId];
+    const localPageBefore = localBefore ? localBefore.page : null;
+    const localUpdatedBefore = localBefore ? (localBefore.updated || 0) : 0;
+    refreshProgress().then(() => {
+      // Only act if the reader is still showing the same book.
+      if (!state.reader || state.reader.file.id !== targetId) return;
+      const after = state.progress.files[targetId];
+      if (!after) return;
+      // Re-seek only when the cloud genuinely had a NEWER record than what
+      // we opened with — avoids yanking the user if they intentionally
+      // opened to an older page locally.
+      if ((after.updated || 0) > localUpdatedBefore &&
+          after.page != null &&
+          after.page !== localPageBefore) {
+        state.reader.jumpToPage(after.page + 1);
+        toast(`他のデバイスの続きから再開 (${after.page + 1}ページ)`, 2000);
+      }
+    }).catch(() => {});
+  }
 }
 
 function closeReader() {
