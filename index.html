@@ -1582,10 +1582,19 @@ function getPairOffset(fileId) {
 
 function setProgress(fileId, page, meta) {
   const existing = state.progress.files[fileId] || {};
+  // Only bump the `updated` timestamp when the page (or a meaningful meta
+  // field) actually CHANGES. This is critical for cross-device sync: if we
+  // refreshed `updated` every time — including when merely opening a book
+  // or when the screen turns off on an unchanged page — then a device that
+  // was simply left open on an old page could "win" the timestamp race
+  // against another device that genuinely read further. By keeping the
+  // timestamp tied to real reading activity, the most-recently-READ page
+  // always wins, regardless of which device backgrounded last.
+  const pageChanged = existing.page !== page;
+  const pairChanged = meta && meta.pairOffset != null && existing.pairOffset !== meta.pairOffset;
   const next = {
     ...existing,
     page,
-    updated: Date.now(),
   };
   if (meta) {
     if (meta.name) next.name = meta.name;
@@ -1593,9 +1602,22 @@ function setProgress(fileId, page, meta) {
     if (meta.totalPages != null) next.totalPages = meta.totalPages;
     if (meta.pairOffset != null) next.pairOffset = meta.pairOffset;
   }
+  // Update the timestamp only on genuine reading progress / setting change.
+  // First-ever record for this book also counts as a change.
+  if (pageChanged || pairChanged || existing.updated == null) {
+    next.updated = Date.now();
+  } else {
+    next.updated = existing.updated;
+  }
   state.progress.files[fileId] = next;
   saveLocalMirror();
-  scheduleProgressSave();
+  // Only schedule a cloud write when something actually changed — avoids
+  // pointless PATCHes that could also overwrite a newer record on a slow
+  // network where our read hasn't landed yet.
+  if (pageChanged || pairChanged || existing.updated == null ||
+      next.name !== existing.name || next.totalPages !== existing.totalPages) {
+    scheduleProgressSave();
+  }
 }
 
 function scheduleProgressSave() {
@@ -1726,6 +1748,38 @@ document.addEventListener('visibilitychange', () => {
   }
   // Page coming to foreground — refresh from cloud.
   if (!state.accessToken || !state.progressFileId) return;
+
+  // CASE 1: a reader is open. The user may have read further on another
+  // device while this one was backgrounded (e.g. tablet left open on a
+  // page, then PC reads ahead). Pull the latest progress and re-seek the
+  // open book if the cloud has a newer page for it.
+  if (state.reader && !$('reader-screen').classList.contains('hidden')) {
+    const targetId = state.reader.file.id;
+    const before = state.progress.files[targetId];
+    const beforePage = before ? before.page : null;
+    const beforeUpdated = before ? (before.updated || 0) : 0;
+    refreshProgress().then(() => {
+      if (!state.reader || state.reader.file.id !== targetId) return;
+      const after = state.progress.files[targetId];
+      if (!after || after.page == null) return;
+      // Only jump if the cloud genuinely had a newer record AND it points
+      // to a different page than where we currently are. This avoids
+      // yanking the user when nothing changed elsewhere.
+      if ((after.updated || 0) > beforeUpdated && after.page !== beforePage) {
+        // Guard: don't fight the user if they've already paged somewhere
+        // since the snapshot. Compare against the reader's CURRENT page.
+        const slot = state.reader.slots[state.reader.currentSlotIndex];
+        const curPage = slot ? state.reader._realPage(slot[0]) : null;
+        if (curPage === after.page) return;  // already there
+        state.reader.jumpToPage(after.page + 1);
+        toast(`他のデバイスの続きに同期 (${after.page + 1}ページ)`, 2000);
+      }
+    });
+    return;
+  }
+
+  // CASE 2: the file browser is showing — refresh and re-render the list
+  // so progress tags reflect reading done elsewhere.
   if (!$('browser-screen').classList.contains('hidden')) {
     refreshProgress().then(() => {
       if (state.history) renderHistory();
@@ -3075,6 +3129,10 @@ class Reader {
     this.updateViewModeIcon();
     this.updateSplitModeIcon();
     this.updatePairOffsetButton();
+    // Sync the overlay chrome to the persisted state (0=both, 1=top only,
+    // 2=none). This keeps the user's chosen chrome level across volumes
+    // and ensures the DOM matches after destroy() cleared the bottom strip.
+    applyOverlayState();
     showScreen('reader-screen');
 
     try {
@@ -4714,6 +4772,46 @@ function wireBrowser() {
   });
 }
 
+// ---- Reader overlay visibility state machine -------------------------
+// Two states toggled by the middle tap:
+//   0 = both overlays visible (title bar + thumbnail strip)
+//   1 = both hidden (clean page-only reading view)
+// The state is module-level (not per-Reader) so it persists when the user
+// pages to the next volume — most people want their chosen chrome level
+// to stick across volumes.
+//
+// Initial state is 1 (nothing shown), matching the cleanest first-open
+// experience: the title bar appears only when the user taps the middle.
+let _overlayState = 1;
+
+function applyOverlayState() {
+  const top = $('reader-overlay');
+  const bottom = $('reader-bottom-overlay');
+  if (!top || !bottom) return;
+  if (_overlayState === 0) {
+    // both visible
+    top.classList.remove('hidden-overlay');
+    bottom.classList.remove('hidden-overlay');
+    if (state.reader) state.reader.updateThumbStripCurrent();
+  } else {
+    // nothing
+    top.classList.add('hidden-overlay');
+    bottom.classList.add('hidden-overlay');
+  }
+}
+
+function cycleOverlayState() {
+  _overlayState = _overlayState === 0 ? 1 : 0;
+  applyOverlayState();
+}
+
+// Force a specific overlay state (used when opening the page-jump via the
+// keyboard 'G' shortcut, which needs the overlays visible).
+function setOverlayState(s) {
+  _overlayState = s;
+  applyOverlayState();
+}
+
 function wireReader() {
   $('reader-close').addEventListener('click', navBack);
   $('view-mode-btn').addEventListener('click', () => {
@@ -4846,14 +4944,12 @@ function wireReader() {
     if (xRatio < 1/3)       state.reader.next();
     else if (xRatio > 2/3)  state.reader.prev();
     else {
-      // Middle tap toggles BOTH overlays together so the thumbnail strip
-      // and page-jump appear at the same time as the title bar.
-      $('reader-overlay').classList.toggle('hidden-overlay');
-      $('reader-bottom-overlay').classList.toggle('hidden-overlay');
-      // When opening, scroll the strip to center on the current page.
-      if (!$('reader-bottom-overlay').classList.contains('hidden-overlay')) {
-        state.reader.updateThumbStripCurrent();
-      }
+      // Middle tap toggles between two overlay states:
+      //   0: both overlays shown (title bar + thumbnail strip)
+      //   1: nothing shown (clean full-page reading view)
+      // This gives a distraction-free reading mode while keeping the
+      // title/page info and the thumbnail strip one tap away.
+      cycleOverlayState();
     }
   });
 
@@ -4874,12 +4970,11 @@ function wireReader() {
     else if (e.key === 'p' || e.key === 'P') { if (state.reader) state.reader.togglePairOffset(); }
     else if (e.key === 'f' || e.key === 'F') toggleFullscreen();
     else if (e.key === 'g' || e.key === 'G') {
-      // Open the bottom overlay (if hidden) and focus the page-jump input
-      $('reader-overlay').classList.remove('hidden-overlay');
-      $('reader-bottom-overlay').classList.remove('hidden-overlay');
+      // Open both overlays (page-jump input lives in the bottom strip) and
+      // focus the page-jump input.
+      setOverlayState(0);
       const inp = $('page-jump-input');
       if (inp) { inp.focus(); inp.select(); }
-      if (state.reader) state.reader.updateThumbStripCurrent();
     }
     else handled = false;
 
