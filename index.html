@@ -1659,13 +1659,17 @@ async function flushProgressSave() {
 // keepalive has a 64 KB body limit, which our progress JSON stays well
 // under (a few hundred bytes per book).
 function flushProgressKeepalive() {
-  if (!state.progressFileId || !state.accessToken) return;
+  if (!state.progressFileId || !state.accessToken) {
+    console.log('[keepalive] skipped — no progressFileId or token');
+    return;
+  }
   // Cancel the pending debounced save — we're saving right now.
   if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
   try {
     const body = JSON.stringify(state.progress);
-    // Guard against the 64 KB keepalive cap. Progress JSON is tiny, but
-    // if a user somehow has thousands of books, fall back to the normal
+    console.log('[keepalive] PATCHing progress, body length=', body.length,
+      '| files=', Object.keys(state.progress.files || {}).length);
+    // Guard against the 64 KB keepalive cap — fall back to the normal
     // (non-keepalive) flush which has no size limit.
     if (body.length > 60 * 1024) {
       flushProgressSave();
@@ -1693,6 +1697,8 @@ async function refreshProgress() {
   showSync(true);
   try {
     const data = await readProgressFile(state.progressFileId);
+    console.log('[refreshProgress] cloud data files=',
+      data && data.files ? Object.keys(data.files).length : 0);
     if (data && data.files) {
       // MERGE rather than overwrite. For each book, keep whichever record
       // has the newer `updated` timestamp. This protects progress made on
@@ -1740,12 +1746,20 @@ async function refreshProgress() {
 // another tab/window or a display sleep, so we listen to all of them and
 // debounce to avoid redundant network calls.
 let _lastForegroundSync = 0;
-function syncOnForeground() {
-  if (!state.accessToken || !state.progressFileId) return;
+function syncOnForeground(trigger) {
+  console.log('[sync] syncOnForeground triggered by:', trigger,
+    '| hasToken=', !!state.accessToken, '| progressFileId=', state.progressFileId);
+  if (!state.accessToken || !state.progressFileId) {
+    console.log('[sync] skipped — no token or no progress file');
+    return;
+  }
   // Debounce: if several events fire in quick succession (e.g. focus +
   // visibilitychange together), only run once per second.
   const now = Date.now();
-  if (now - _lastForegroundSync < 1000) return;
+  if (now - _lastForegroundSync < 1000) {
+    console.log('[sync] skipped — debounced (', now - _lastForegroundSync, 'ms since last)');
+    return;
+  }
   _lastForegroundSync = now;
 
   // CASE 1: a reader is open. The user may have read further on another
@@ -1757,28 +1771,46 @@ function syncOnForeground() {
     const before = state.progress.files[targetId];
     const beforePage = before ? before.page : null;
     const beforeUpdated = before ? (before.updated || 0) : 0;
+    console.log('[sync] reader open for', targetId,
+      '| localBefore page=', beforePage, 'updated=', beforeUpdated);
     refreshProgress().then(() => {
-      if (!state.reader || state.reader.file.id !== targetId) return;
+      if (!state.reader || state.reader.file.id !== targetId) {
+        console.log('[sync] reader changed during refresh, aborting');
+        return;
+      }
       const after = state.progress.files[targetId];
-      if (!after || after.page == null) return;
+      console.log('[sync] after refresh:', after);
+      if (!after || after.page == null) {
+        console.log('[sync] no usable cloud record');
+        return;
+      }
       // Where is the reader actually sitting right now?
       const slot = state.reader.slots[state.reader.currentSlotIndex];
       const curPage = slot ? state.reader._realPage(slot[0]) : null;
-      if (curPage === after.page) return;  // already there, nothing to do
+      console.log('[sync] reader currently on page', curPage,
+        '| cloud says page', after.page, 'updated', after.updated);
+      if (curPage === after.page) {
+        console.log('[sync] already on cloud page, nothing to do');
+        return;
+      }
       // Jump if the cloud record is newer than what we had before the
       // refresh, OR (defensively) if the cloud simply points somewhere
-      // different and is at least as new — covers clock-skew edge cases
-      // where the timestamps are very close.
+      // different and is at least as new — covers clock-skew edge cases.
       if ((after.updated || 0) >= beforeUpdated && after.page !== curPage) {
+        console.log('[sync] JUMPING to page', after.page + 1);
         state.reader.jumpToPage(after.page + 1);
         toast(`他のデバイスの続きに同期 (${after.page + 1}ページ)`, 2000);
+      } else {
+        console.log('[sync] NOT jumping — cloud not newer (cloud',
+          after.updated, 'vs before', beforeUpdated, ')');
       }
-    });
+    }).catch(e => console.warn('[sync] refresh failed:', e));
     return;
   }
 
   // CASE 2: the file browser is showing — refresh and re-render the list
   // so progress tags reflect reading done elsewhere.
+  console.log('[sync] no reader open, refreshing browser list');
   if (!$('browser-screen').classList.contains('hidden')) {
     refreshProgress().then(() => {
       if (state.history) renderHistory();
@@ -1798,10 +1830,11 @@ function syncOnForeground() {
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
     // Page going to background — save NOW, reliably.
+    console.log('[sync] visibilitychange → HIDDEN, flushing');
     flushProgressKeepalive();
     return;
   }
-  syncOnForeground();
+  syncOnForeground('visibilitychange');
 });
 
 // Desktop browsers often DON'T fire visibilitychange when you switch to
@@ -1809,21 +1842,20 @@ document.addEventListener('visibilitychange', () => {
 // when returning from a display sleep. The window focus event is more
 // reliable for those cases. We also flush on blur as a save opportunity.
 window.addEventListener('focus', () => {
-  syncOnForeground();
+  syncOnForeground('focus');
 });
 window.addEventListener('blur', () => {
   // Losing focus is a good moment to persist — desktop user may be
   // switching to another device. Use keepalive in case the tab is later
   // discarded without another event.
+  console.log('[sync] window blur, flushing');
   flushProgressKeepalive();
 });
 
 // pageshow fires when navigating back to the page, including restores
 // from the back/forward cache (where load/DOMContentLoaded won't fire).
 window.addEventListener('pageshow', (e) => {
-  // persisted === true means restored from bfcache — definitely need a
-  // fresh sync since our in-memory state may be stale.
-  syncOnForeground();
+  syncOnForeground('pageshow');
 });
 
 // pagehide fires when the page is being unloaded OR put into the back/
