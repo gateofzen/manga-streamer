@@ -3145,20 +3145,24 @@ class Reader {
     this.prevFile = null;
     if (seriesCtx && seriesCtx.siblings && seriesCtx.siblings.length > 1) {
       const parsed = parseSeriesAndVolume(file.name);
+      console.log('[prev-vol] from folder ctx — parsed=', parsed,
+        'siblings=', seriesCtx.siblings.map(s => s.name));
       if (parsed) {
         const others = seriesCtx.siblings.filter(f => f.id !== file.id);
         this.nextFile = _pickNextVolume(others, parsed);
         this.prevFile = _pickPrevVolume(others, parsed);
+        console.log('[prev-vol] folder pick:',
+          this.prevFile ? this.prevFile.name : '(none)');
       } else if (seriesCtx.index >= 0 && seriesCtx.index + 1 < seriesCtx.siblings.length) {
-        // Couldn't parse a volume — fall back to "next sibling in list order"
-        // as a best-effort guess. Drive-wide search will be skipped because
-        // we have a candidate, but if this is wrong the user just won't see
-        // it auto-advance to the right thing — no worse than before.
         this.nextFile = seriesCtx.siblings[seriesCtx.index + 1];
         if (seriesCtx.index > 0) {
           this.prevFile = seriesCtx.siblings[seriesCtx.index - 1];
         }
+        console.log('[prev-vol] unparseable, fallback pick:',
+          this.prevFile ? this.prevFile.name : '(none)');
       }
+    } else {
+      console.log('[prev-vol] no folder ctx — will rely on Drive search');
     }
     // Always run a Drive-wide search in the background. Even when we picked
     // a sibling from the folder, the Drive search may turn up a better match
@@ -3318,6 +3322,7 @@ class Reader {
   async searchPrevVolume() {
     try {
       const found = await findPrevVolumeInDrive(this.file);
+      console.log('[prev-vol] Drive search result:', found ? found.name : '(none)');
       if (this.cancelled || !found) return;
 
       // If we already had an in-folder candidate, only replace it when the
@@ -3328,6 +3333,7 @@ class Reader {
         const oldP = parseSeriesAndVolume(this.prevFile.name);
         const newP = parseSeriesAndVolume(found.name);
         if (oldP && newP && newP.volume <= oldP.volume) {
+          console.log('[prev-vol] keeping folder pick (closer than Drive result)');
           return;
         }
       }
@@ -3338,6 +3344,8 @@ class Reader {
       // the slot's contents because the slot wasn't there before.
       const hadPrevSentinel = this.slots.length > 0 && this.slots[0][0] === '__prev__';
       this.prevFile = found;
+      console.log('[prev-vol] adopting prev=', found.name,
+        'hadPrevSentinel=', hadPrevSentinel);
       if (!hadPrevSentinel) {
         // Late discovery — rebuild slots WITH the prev sentinel and re-render.
         // The current reading position shifts by +1 to account for the new
@@ -3345,14 +3353,17 @@ class Reader {
         this.slots.unshift(['__prev__']);
         this.currentSlotIndex += 1;
         this.renderSlots();
-        // Re-scroll to keep the user where they were.
+        // Re-attach already-loaded page bitmaps and re-scroll to keep the
+        // user where they were. renderSlots() blanks the DOM, so the
+        // previously-rendered pages need their cached images re-applied.
         requestAnimationFrame(() => {
           this.scrollToSlot(this.currentSlotIndex, false);
           this.updateCounter();
           this.updateThumbStripCurrent();
         });
-        // Rebuild the thumbnail strip so it includes the new prev slot.
-        this.buildThumbStrip();
+        // Note: we do NOT rebuild the thumbnail strip — it iterates
+        // imageEntries (not slots), so the prev sentinel doesn't appear
+        // there. Rebuilding would discard already-loaded thumb blobs.
       } else {
         this.refreshPrevSentinelSlot();
       }
@@ -3485,6 +3496,8 @@ class Reader {
     // with a "シリーズの最初" card before page 1. If the background Drive
     // search later discovers a prev volume, slots are rebuilt on the fly
     // by searchPrevVolume().
+    console.log('[prev-vol] buildSlots: prevFile=',
+      this.prevFile ? this.prevFile.name : '(none)');
     if (this.prevFile) {
       slots.unshift(['__prev__']);
     }
