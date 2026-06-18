@@ -1237,8 +1237,20 @@ async function _driveFetchInner(url, init, tag) {
       const r = await fetch(url, Object.assign({}, fetchInit, { headers: hdrs }));
       return r;
     } catch (err) {
+      if (err && err.name === 'AbortError') {
+        // Distinguish the internal timeout abort from a user-initiated abort
+        // (jumpToPage, reader destroy, thumbnail leaving viewport, etc).
+        // ctl.signal.aborted === true means OUR local timeout fired; in that
+        // case rethrow as "Network timeout" so the caller can show a useful
+        // message. Otherwise the abort came from the caller's signal — it's
+        // expected control flow and we re-throw the AbortError untouched
+        // (and silently, no console noise).
+        if (ctl.signal.aborted) {
+          throw new Error('Network timeout');
+        }
+        throw err;
+      }
       console.warn(tag, 'fetch threw:', err.name, err.message);
-      if (err && err.name === 'AbortError') throw new Error('Network timeout');
       throw err;
     }
   };
@@ -1284,13 +1296,15 @@ function composeAbort(a, b) {
 
 // Helper: read response body with timeout still active, then cleanup.
 // Use this instead of plain `await resp.arrayBuffer()` after driveFetch.
+// AbortError can come from two sources here: our local 45s timeout, or
+// the caller's signal (jumpToPage, reader destroy, thumb leaving view).
+// We let it propagate as-is — the calling code already treats AbortError
+// as expected control flow and either retries or silently bails. We no
+// longer remap to "Network timeout" because that mislabeled user-driven
+// aborts and produced misleading error messages in the reader UI.
 async function readBodyArrayBuffer(resp) {
   try {
-    const ab = await resp.arrayBuffer();
-    return ab;
-  } catch (err) {
-    if (err && err.name === 'AbortError') throw new Error('Network timeout');
-    throw err;
+    return await resp.arrayBuffer();
   } finally {
     if (resp._timeoutCleanup) resp._timeoutCleanup();
   }
@@ -1299,9 +1313,6 @@ async function readBodyArrayBuffer(resp) {
 async function readBodyJson(resp) {
   try {
     return await resp.json();
-  } catch (err) {
-    if (err && err.name === 'AbortError') throw new Error('Network timeout');
-    throw err;
   } finally {
     if (resp._timeoutCleanup) resp._timeoutCleanup();
   }
@@ -1310,9 +1321,6 @@ async function readBodyJson(resp) {
 async function readBodyBlob(resp) {
   try {
     return await resp.blob();
-  } catch (err) {
-    if (err && err.name === 'AbortError') throw new Error('Network timeout');
-    throw err;
   } finally {
     if (resp._timeoutCleanup) resp._timeoutCleanup();
   }
