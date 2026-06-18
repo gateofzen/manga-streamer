@@ -3153,24 +3153,16 @@ class Reader {
     this.prevFile = null;
     if (seriesCtx && seriesCtx.siblings && seriesCtx.siblings.length > 1) {
       const parsed = parseSeriesAndVolume(file.name);
-      console.log('[prev-vol] from folder ctx — parsed=', parsed,
-        'siblings=', seriesCtx.siblings.map(s => s.name));
       if (parsed) {
         const others = seriesCtx.siblings.filter(f => f.id !== file.id);
         this.nextFile = _pickNextVolume(others, parsed);
         this.prevFile = _pickPrevVolume(others, parsed);
-        console.log('[prev-vol] folder pick:',
-          this.prevFile ? this.prevFile.name : '(none)');
       } else if (seriesCtx.index >= 0 && seriesCtx.index + 1 < seriesCtx.siblings.length) {
         this.nextFile = seriesCtx.siblings[seriesCtx.index + 1];
         if (seriesCtx.index > 0) {
           this.prevFile = seriesCtx.siblings[seriesCtx.index - 1];
         }
-        console.log('[prev-vol] unparseable, fallback pick:',
-          this.prevFile ? this.prevFile.name : '(none)');
       }
-    } else {
-      console.log('[prev-vol] no folder ctx — will rely on Drive search');
     }
     // Always run a Drive-wide search in the background. Even when we picked
     // a sibling from the folder, the Drive search may turn up a better match
@@ -3327,56 +3319,42 @@ class Reader {
   }
 
   // Background search for the previous volume — mirror of searchNextVolume.
+  // Updates the prev-sentinel slot in place when search completes, and
+  // honors a queued "advance to prev" request if the user clicked while
+  // the search was still running.
   async searchPrevVolume() {
     try {
       const found = await findPrevVolumeInDrive(this.file);
-      console.log('[prev-vol] Drive search result:', found ? found.name : '(none)');
-      if (this.cancelled || !found) return;
+      if (this.cancelled) return;
 
-      // If we already had an in-folder candidate, only replace it when the
-      // Drive-wide pick has a STRICTLY HIGHER volume number (closer to
-      // current, meaning the in-folder pick had skipped a volume that
-      // exists elsewhere). Otherwise, keep the folder pick.
-      if (this.prevFile) {
+      if (found && this.prevFile) {
+        // If we already had an in-folder candidate, only replace it when the
+        // Drive-wide pick has a STRICTLY HIGHER volume number (closer to
+        // current, meaning the in-folder pick had skipped a volume that
+        // exists elsewhere). Otherwise, keep the folder pick.
         const oldP = parseSeriesAndVolume(this.prevFile.name);
         const newP = parseSeriesAndVolume(found.name);
-        if (oldP && newP && newP.volume <= oldP.volume) {
-          console.log('[prev-vol] keeping folder pick (closer than Drive result)');
-          return;
+        if (!(oldP && newP && newP.volume <= oldP.volume)) {
+          this.prevFile = found;
         }
-      }
-
-      // If the Drive-wide search just NOW found a prev volume we didn't
-      // know about, we need to insert the prev sentinel slot into the
-      // existing slots array. This is more involved than just refreshing
-      // the slot's contents because the slot wasn't there before.
-      const hadPrevSentinel = this.slots.length > 0 && this.slots[0][0] === '__prev__';
-      this.prevFile = found;
-      console.log('[prev-vol] adopting prev=', found.name,
-        'hadPrevSentinel=', hadPrevSentinel);
-      if (!hadPrevSentinel) {
-        // Late discovery — rebuild slots WITH the prev sentinel and re-render.
-        // The current reading position shifts by +1 to account for the new
-        // slot at index 0.
-        this.slots.unshift(['__prev__']);
-        this.currentSlotIndex += 1;
-        this.renderSlots();
-        // Re-attach already-loaded page bitmaps and re-scroll to keep the
-        // user where they were. renderSlots() blanks the DOM, so the
-        // previously-rendered pages need their cached images re-applied.
-        requestAnimationFrame(() => {
-          this.scrollToSlot(this.currentSlotIndex, false);
-          this.updateCounter();
-          this.updateThumbStripCurrent();
-        });
-        // Note: we do NOT rebuild the thumbnail strip — it iterates
-        // imageEntries (not slots), so the prev sentinel doesn't appear
-        // there. Rebuilding would discard already-loaded thumb blobs.
-      } else {
-        this.refreshPrevSentinelSlot();
+      } else if (found) {
+        this.prevFile = found;
       }
     } catch (e) {
       console.warn('Prev-volume search failed:', e);
+    } finally {
+      // Always clear the pending flag — the sentinel updates from
+      // "searching..." to either the prev card or "シリーズの最初".
+      this.prevSearchPending = false;
+      if (!this.cancelled) {
+        this.refreshPrevSentinelSlot();
+        // If the user clicked through to the sentinel during the search
+        // and the prev was found, honor their intent now.
+        if (this.prevFile && this._pendingPrevAdvance && !this._advanced) {
+          this._advanced = true;
+          this.advanceToPrev();
+        }
+      }
     }
   }
 
@@ -3417,9 +3395,9 @@ class Reader {
     }
   }
 
-  // Mirror of refreshSentinelSlot, but for the prev-volume sentinel at
-  // the START of the slot list. Re-renders just that slot's contents
-  // without rebuilding the rest of the DOM.
+  // Re-render just the prev-volume sentinel slot in place. Called whenever
+  // the prev search state changes (search completes, prevFile is set, etc).
+  // Three visual states, mirroring renderSlots above.
   refreshPrevSentinelSlot() {
     const container = $('reader-pages');
     const sentinelIdx = this.slots.findIndex(s => s[0] === '__prev__');
@@ -3427,8 +3405,9 @@ class Reader {
     const slotEl = container.querySelector(`.page-slot[data-slot="${sentinelIdx}"]`);
     if (!slotEl) return;
     const prev = this.prevFile;
-    const inner = prev
-      ? `
+    let inner;
+    if (prev) {
+      inner = `
         <div class="next-volume-card">
           <div class="next-volume-thumb">
             <div class="thumb-fallback"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg></div>
@@ -3436,14 +3415,25 @@ class Reader {
           </div>
           <div class="next-volume-label">前の巻</div>
           <div class="next-volume-name">${escapeHtml(prev.name)}</div>
-          <div class="next-volume-hint">もう一度めくると開きます</div>
-        </div>`
-      : `
+          <div class="next-volume-hint">右側タップで開く / 左側でページ1へ</div>
+        </div>`;
+    } else if (this.prevSearchPending) {
+      inner = `
+        <div class="next-volume-card">
+          <div class="next-volume-thumb">
+            <div class="thumb-fallback"><div class="spinner small"></div></div>
+          </div>
+          <div class="next-volume-label">前の巻を検索中…</div>
+          <div class="next-volume-hint">左側タップでページ1へ</div>
+        </div>`;
+    } else {
+      inner = `
         <div class="next-volume-card">
           <div class="next-volume-label">シリーズの最初</div>
           <div class="next-volume-name">${escapeHtml(this.file.name)}</div>
           <div class="next-volume-hint">これが最初の巻です</div>
         </div>`;
+    }
     slotEl.innerHTML = `<div class="page-cell">${inner}</div>`;
     if (prev) {
       const img = $('prev-vol-thumb');
@@ -3496,19 +3486,12 @@ class Reader {
     // Always append even when nextFile is null — in that case it shows
     // "シリーズ完結" instead.
     slots.push(['__next__']);
-    // Prepend a sentinel "prev volume" slot at the very start IF a prev
-    // volume is known. Unlike the next sentinel — which always exists so
-    // the user gets feedback at the end of a book — the prev sentinel
-    // ONLY appears when there's actually a previous volume to go back to.
-    // We don't want vol 1 of a series (or a standalone book) to start
-    // with a "シリーズの最初" card before page 1. If the background Drive
-    // search later discovers a prev volume, slots are rebuilt on the fly
-    // by searchPrevVolume().
-    console.log('[prev-vol] buildSlots: prevFile=',
-      this.prevFile ? this.prevFile.name : '(none)');
-    if (this.prevFile) {
-      slots.unshift(['__prev__']);
-    }
+    // Symmetric prev-volume sentinel at the start. Always inserted (even
+    // when prevFile isn't known yet) so the user sees an instant response
+    // when they page backward from page 1, instead of waiting for the
+    // Drive search to populate it later. The card's contents update via
+    // refreshPrevSentinelSlot when the search completes.
+    slots.unshift(['__prev__']);
     this.slots = slots;
   }
 
@@ -3709,14 +3692,20 @@ class Reader {
   }
 
   findSlotForPage(pageIdx) {
+    let firstContent = 0;
     for (let i = 0; i < this.slots.length; i++) {
       const slot = this.slots[i];
       if (slot[0] === '__next__' || slot[0] === '__prev__') continue;  // skip sentinels
+      // Remember the first non-sentinel slot for the fallback below.
+      // Without this, an unknown pageIdx would land the user on the prev
+      // sentinel (slot 0) — meaning every fresh open without saved progress
+      // would briefly show "前の巻" before the user can react.
+      if (!firstContent) firstContent = i;
       for (const it of slot) {
         if (this._realPage(it) === pageIdx) return i;
       }
     }
-    return 0;
+    return firstContent;
   }
 
   renderSlots() {
@@ -3725,11 +3714,18 @@ class Reader {
     // following scrollToSlot() will reset this flag once it's done.
     this._programmaticScroll = true;
     container.innerHTML = this.slots.map((pageIndices, slotIdx) => {
-      // Sentinel slot for "prev volume" prompt at the very start
+      // Sentinel slot for "prev volume" prompt at the very start.
+      // Three visual states depending on what we know about the prev:
+      //   - prevFile set:        full card with thumbnail + name
+      //   - searching, no result yet: "前の巻を検索中..." placeholder
+      //   - search done, no prev:    "シリーズの最初" terminator
+      // Always present so the user gets immediate feedback when paging
+      // backward from page 1, rather than waiting for the Drive search.
       if (pageIndices[0] === '__prev__') {
         const prev = this.prevFile;
-        const inner = prev
-          ? `
+        let inner;
+        if (prev) {
+          inner = `
             <div class="next-volume-card">
               <div class="next-volume-thumb">
                 <div class="thumb-fallback"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg></div>
@@ -3737,14 +3733,25 @@ class Reader {
               </div>
               <div class="next-volume-label">前の巻</div>
               <div class="next-volume-name">${escapeHtml(prev.name)}</div>
-              <div class="next-volume-hint">もう一度めくると開きます</div>
-            </div>`
-          : `
+              <div class="next-volume-hint">右側タップで開く / 左側でページ1へ</div>
+            </div>`;
+        } else if (this.prevSearchPending) {
+          inner = `
+            <div class="next-volume-card">
+              <div class="next-volume-thumb">
+                <div class="thumb-fallback"><div class="spinner small"></div></div>
+              </div>
+              <div class="next-volume-label">前の巻を検索中…</div>
+              <div class="next-volume-hint">左側タップでページ1へ</div>
+            </div>`;
+        } else {
+          inner = `
             <div class="next-volume-card">
               <div class="next-volume-label">シリーズの最初</div>
               <div class="next-volume-name">${escapeHtml(this.file.name)}</div>
               <div class="next-volume-hint">これが最初の巻です</div>
             </div>`;
+        }
         return `<div class="page-slot next-slot prev-slot" data-slot="${slotIdx}"><div class="page-cell">${inner}</div></div>`;
       }
       // Sentinel slot for "next volume" prompt at the very end
@@ -3798,9 +3805,10 @@ class Reader {
         });
       }
     }
-    // Same for the prev-volume sentinel thumbnail. We scope the fallback
-    // query to the prev-slot specifically so we don't accidentally match
-    // the next-slot's fallback element (same class names).
+    // Prev-volume thumbnail. Scope the fallback query to the prev-slot
+    // specifically so we don't match the next-slot's fallback (same class
+    // names) — the prev-slot may have a spinner-style fallback while
+    // searching, which we only want to hide once the real image lands.
     if (this.prevFile) {
       const img = $('prev-vol-thumb');
       if (img) {
@@ -3851,7 +3859,13 @@ class Reader {
       return;
     }
     if (slot[0] === '__prev__') {
-      $('page-counter').textContent = this.prevFile ? '← 前の巻' : '最初の巻';
+      if (this.prevFile) {
+        $('page-counter').textContent = '← 前の巻';
+      } else if (this.prevSearchPending) {
+        $('page-counter').textContent = '検索中…';
+      } else {
+        $('page-counter').textContent = '最初の巻';
+      }
       return;
     }
     // Map slot entries to real page indices for the counter. In split mode,
@@ -3906,12 +3920,20 @@ class Reader {
   }
 
   prev() {
-    // If we're already on the prev-volume sentinel, the user is trying to
-    // page past it — that's the trigger to open the previous volume.
     const cur = this.slots[this.currentSlotIndex];
-    if (cur && cur[0] === '__prev__' && this.prevFile && !this._advanced) {
-      this._advanced = true;
-      this.advanceToPrev();
+    // On the prev-volume sentinel:
+    //   - If prev is known: open it (single action)
+    //   - If still searching: queue the action and let the user know;
+    //     the search-completion path will fire advanceToPrev for them
+    //   - If no prev exists: do nothing (the sentinel says "最初の巻")
+    if (cur && cur[0] === '__prev__') {
+      if (this.prevFile && !this._advanced) {
+        this._advanced = true;
+        this.advanceToPrev();
+      } else if (this.prevSearchPending) {
+        this._pendingPrevAdvance = true;
+        toast('前の巻を検索中…', 1500);
+      }
       return;
     }
     if (this.currentSlotIndex > 0) {
@@ -5177,16 +5199,28 @@ function wireReader() {
   // Left third → next (RTL advance), middle → toggle overlay, right third → prev.
   $('reader-pages').addEventListener('click', (e) => {
     if (!state.reader) return;
-    // On the next-volume or prev-volume sentinel slot, any tap (including
-    // the middle area) opens that volume. Otherwise the user would have to
-    // find a specific edge — confusing on a "press to continue" prompt.
+    // On the next-volume sentinel slot, any tap (including the middle area)
+    // advances to the next volume. Otherwise the user would have to find a
+    // specific edge — confusing on a "press to continue" prompt.
     const cur = state.reader.slots[state.reader.currentSlotIndex];
     if (cur && cur[0] === '__next__') {
       state.reader.next();
       return;
     }
+    // On the prev-volume sentinel, the user has two meaningful directions:
+    //   - Left side (RTL forward) → return to page 1 of this volume
+    //   - Right side (RTL backward) → open the previous volume
+    //   - Middle → toggle overlay, same as on regular pages
+    // We don't follow the "any tap" rule used by the next sentinel because
+    // returning to page 1 is a very common reason to land on this card
+    // (the user paged past it by accident) and we want that to be a single
+    // intuitive tap, not a back-out.
     if (cur && cur[0] === '__prev__') {
-      state.reader.prev();
+      const rect = e.currentTarget.getBoundingClientRect();
+      const xRatio = (e.clientX - rect.left) / rect.width;
+      if (xRatio < 1/3)       state.reader.next();   // → page 1
+      else if (xRatio > 2/3)  state.reader.prev();   // → open prev volume
+      else                    cycleOverlayState();   // middle = overlay toggle
       return;
     }
     const rect = e.currentTarget.getBoundingClientRect();
