@@ -2576,10 +2576,33 @@ function _pickNextVolume(candidates, parsedCurrent) {
   return matches[0].file;
 }
 
-async function findNextVolumeInDrive(currentFile) {
-  const parsed = parseSeriesAndVolume(currentFile.name);
-  if (!parsed) return null;
+// Mirror of _pickNextVolume that returns the previous volume — the
+// highest-numbered volume STRICTLY LESS than the current one in the
+// same series. Used so the user can navigate back from vol 2 to vol 1
+// without leaving the reader.
+function _pickPrevVolume(candidates, parsedCurrent) {
+  if (!parsedCurrent) return null;
+  const target = _normSeries(parsedCurrent.series);
+  const matches = [];
+  for (const f of candidates) {
+    const p = parseSeriesAndVolume(f.name);
+    if (!p) continue;
+    if (_normSeries(p.series) !== target) continue;
+    if (p.volume >= parsedCurrent.volume) continue;
+    matches.push({ file: f, volume: p.volume });
+  }
+  if (!matches.length) return null;
+  // Highest volume below current = "immediately previous".
+  matches.sort((a, b) => b.volume - a.volume);
+  return matches[0].file;
+}
 
+// Gather all sibling-volume candidates for currentFile from Drive: the
+// file's parent-folder contents plus Drive-wide text searches by series
+// keyword. Returns a list of File records (excluding currentFile itself).
+// Used by both findNextVolumeInDrive and findPrevVolumeInDrive; sharing
+// this avoids paying the Drive RTT cost twice.
+async function _gatherVolumeCandidates(currentFile, parsed) {
   // Try two Drive search keywords. The first (cleaned full series name) is
   // more specific but Drive's `name contains` is token-based and may fail
   // on exact-string matches with mixed scripts; the second (longest token)
@@ -2596,11 +2619,11 @@ async function findNextVolumeInDrive(currentFile) {
   // is unreliable for short CJK names (tokenization splits them in ways
   // that miss substring matches), but listing the parent folder always
   // returns the exact set of siblings. This is the most reliable source
-  // of next-volume candidates — even when the user opened the file from
-  // history (no seriesCtx) or from a different folder than its actual home.
+  // of sibling-volume candidates — even when the user opened the file
+  // from history (no seriesCtx) or from a different folder than its
+  // actual home.
   const parentListPromise = (async () => {
     try {
-      // Fetch the file's parents if they aren't already on the file object.
       let parentIds = currentFile.parents;
       if (!parentIds || !parentIds.length) {
         const resp = await driveFetch(
@@ -2612,26 +2635,21 @@ async function findNextVolumeInDrive(currentFile) {
         }
       }
       if (!parentIds || !parentIds.length) return [];
-      // Usually a file has just one parent. Listing each in parallel handles
-      // the rare multi-parent case (shortcuts, shared items).
       const lists = await Promise.all(parentIds.map(pid =>
         listFolder(pid).catch(() => [])
       ));
-      const flat = lists.flat();
-      return flat;
+      return lists.flat();
     } catch (e) {
-      console.warn('[next-volume] parent folder list failed:', e);
+      console.warn('[volume-search] parent folder list failed:', e);
       return [];
     }
   })();
 
   // Run text searches in parallel with the parent-folder listing.
   const searchPromises = queries.map(async q => {
-    try {
-      const r = await searchDrive(q);
-      return r;
-    } catch (e) {
-      console.warn('[next-volume] search failed for', q, e);
+    try { return await searchDrive(q); }
+    catch (e) {
+      console.warn('[volume-search] search failed for', q, e);
       return [];
     }
   });
@@ -2655,10 +2673,21 @@ async function findNextVolumeInDrive(currentFile) {
   };
   addAll(parentSiblings);
   for (const list of searchResults) addAll(list);
-  const candidates = [...byId.values()];
+  return [...byId.values()];
+}
 
-  const picked = _pickNextVolume(candidates, parsed);
-  return picked;
+async function findNextVolumeInDrive(currentFile) {
+  const parsed = parseSeriesAndVolume(currentFile.name);
+  if (!parsed) return null;
+  const candidates = await _gatherVolumeCandidates(currentFile, parsed);
+  return _pickNextVolume(candidates, parsed);
+}
+
+async function findPrevVolumeInDrive(currentFile) {
+  const parsed = parseSeriesAndVolume(currentFile.name);
+  if (!parsed) return null;
+  const candidates = await _gatherVolumeCandidates(currentFile, parsed);
+  return _pickPrevVolume(candidates, parsed);
 }
 const ZIP_EXT = /\.(zip|cbz)$/i;
 const IMAGE_EXT = /\.(jpe?g|png|webp|gif|bmp|avif)$/i;
@@ -3113,23 +3142,29 @@ class Reader {
     // We only fall back to "next-in-list" when the current file's name
     // doesn't parse into a volume number at all.
     this.nextFile = null;
+    this.prevFile = null;
     if (seriesCtx && seriesCtx.siblings && seriesCtx.siblings.length > 1) {
       const parsed = parseSeriesAndVolume(file.name);
       if (parsed) {
         const others = seriesCtx.siblings.filter(f => f.id !== file.id);
         this.nextFile = _pickNextVolume(others, parsed);
+        this.prevFile = _pickPrevVolume(others, parsed);
       } else if (seriesCtx.index >= 0 && seriesCtx.index + 1 < seriesCtx.siblings.length) {
         // Couldn't parse a volume — fall back to "next sibling in list order"
         // as a best-effort guess. Drive-wide search will be skipped because
         // we have a candidate, but if this is wrong the user just won't see
         // it auto-advance to the right thing — no worse than before.
         this.nextFile = seriesCtx.siblings[seriesCtx.index + 1];
+        if (seriesCtx.index > 0) {
+          this.prevFile = seriesCtx.siblings[seriesCtx.index - 1];
+        }
       }
     }
     // Always run a Drive-wide search in the background. Even when we picked
     // a sibling from the folder, the Drive search may turn up a better match
     // (e.g. a newer volume that lives in a different folder).
     this.nextSearchPending = true;
+    this.prevSearchPending = true;
     this.zip = null;
     this.imageEntries = [];
     this.slots = [];                 // each is array of page indices, OR ['__next__'] sentinel
@@ -3235,11 +3270,15 @@ class Reader {
         this.preload();
       });
 
-      // If we don't already have a next file from folder context, look it up
-      // by parsing the series name and searching Drive globally. This runs
-      // in the background so the reader becomes interactive immediately.
+      // If we don't already have sibling-volume info from folder context,
+      // look it up by parsing the series name and searching Drive globally.
+      // Both searches run in the background so the reader becomes
+      // interactive immediately.
       if (this.nextSearchPending) {
         this.searchNextVolume();
+      }
+      if (this.prevSearchPending) {
+        this.searchPrevVolume();
       }
     } catch (e) {
       console.error(tag, 'FAILED:', e);
@@ -3275,6 +3314,53 @@ class Reader {
     }
   }
 
+  // Background search for the previous volume — mirror of searchNextVolume.
+  async searchPrevVolume() {
+    try {
+      const found = await findPrevVolumeInDrive(this.file);
+      if (this.cancelled || !found) return;
+
+      // If we already had an in-folder candidate, only replace it when the
+      // Drive-wide pick has a STRICTLY HIGHER volume number (closer to
+      // current, meaning the in-folder pick had skipped a volume that
+      // exists elsewhere). Otherwise, keep the folder pick.
+      if (this.prevFile) {
+        const oldP = parseSeriesAndVolume(this.prevFile.name);
+        const newP = parseSeriesAndVolume(found.name);
+        if (oldP && newP && newP.volume <= oldP.volume) {
+          return;
+        }
+      }
+
+      // If the Drive-wide search just NOW found a prev volume we didn't
+      // know about, we need to insert the prev sentinel slot into the
+      // existing slots array. This is more involved than just refreshing
+      // the slot's contents because the slot wasn't there before.
+      const hadPrevSentinel = this.slots.length > 0 && this.slots[0][0] === '__prev__';
+      this.prevFile = found;
+      if (!hadPrevSentinel) {
+        // Late discovery — rebuild slots WITH the prev sentinel and re-render.
+        // The current reading position shifts by +1 to account for the new
+        // slot at index 0.
+        this.slots.unshift(['__prev__']);
+        this.currentSlotIndex += 1;
+        this.renderSlots();
+        // Re-scroll to keep the user where they were.
+        requestAnimationFrame(() => {
+          this.scrollToSlot(this.currentSlotIndex, false);
+          this.updateCounter();
+          this.updateThumbStripCurrent();
+        });
+        // Rebuild the thumbnail strip so it includes the new prev slot.
+        this.buildThumbStrip();
+      } else {
+        this.refreshPrevSentinelSlot();
+      }
+    } catch (e) {
+      console.warn('Prev-volume search failed:', e);
+    }
+  }
+
   refreshSentinelSlot() {
     const container = $('reader-pages');
     const sentinelIdx = this.slots.findIndex(s => s[0] === '__next__');
@@ -3306,6 +3392,46 @@ class Reader {
         loadThumbnail(next, img, { force: true }).then(url => {
           if (this.cancelled || !url) return;
           const fallback = container.querySelector('.next-volume-thumb .thumb-fallback');
+          if (fallback) fallback.style.display = 'none';
+        });
+      }
+    }
+  }
+
+  // Mirror of refreshSentinelSlot, but for the prev-volume sentinel at
+  // the START of the slot list. Re-renders just that slot's contents
+  // without rebuilding the rest of the DOM.
+  refreshPrevSentinelSlot() {
+    const container = $('reader-pages');
+    const sentinelIdx = this.slots.findIndex(s => s[0] === '__prev__');
+    if (sentinelIdx < 0) return;
+    const slotEl = container.querySelector(`.page-slot[data-slot="${sentinelIdx}"]`);
+    if (!slotEl) return;
+    const prev = this.prevFile;
+    const inner = prev
+      ? `
+        <div class="next-volume-card">
+          <div class="next-volume-thumb">
+            <div class="thumb-fallback"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg></div>
+            <img alt="" id="prev-vol-thumb" style="display:none">
+          </div>
+          <div class="next-volume-label">前の巻</div>
+          <div class="next-volume-name">${escapeHtml(prev.name)}</div>
+          <div class="next-volume-hint">もう一度めくると開きます</div>
+        </div>`
+      : `
+        <div class="next-volume-card">
+          <div class="next-volume-label">シリーズの最初</div>
+          <div class="next-volume-name">${escapeHtml(this.file.name)}</div>
+          <div class="next-volume-hint">これが最初の巻です</div>
+        </div>`;
+    slotEl.innerHTML = `<div class="page-cell">${inner}</div>`;
+    if (prev) {
+      const img = $('prev-vol-thumb');
+      if (img) {
+        loadThumbnail(prev, img, { force: true }).then(url => {
+          if (this.cancelled || !url) return;
+          const fallback = slotEl.querySelector('.next-volume-thumb .thumb-fallback');
           if (fallback) fallback.style.display = 'none';
         });
       }
@@ -3351,6 +3477,17 @@ class Reader {
     // Always append even when nextFile is null — in that case it shows
     // "シリーズ完結" instead.
     slots.push(['__next__']);
+    // Prepend a sentinel "prev volume" slot at the very start IF a prev
+    // volume is known. Unlike the next sentinel — which always exists so
+    // the user gets feedback at the end of a book — the prev sentinel
+    // ONLY appears when there's actually a previous volume to go back to.
+    // We don't want vol 1 of a series (or a standalone book) to start
+    // with a "シリーズの最初" card before page 1. If the background Drive
+    // search later discovers a prev volume, slots are rebuilt on the fly
+    // by searchPrevVolume().
+    if (this.prevFile) {
+      slots.unshift(['__prev__']);
+    }
     this.slots = slots;
   }
 
@@ -3553,7 +3690,7 @@ class Reader {
   findSlotForPage(pageIdx) {
     for (let i = 0; i < this.slots.length; i++) {
       const slot = this.slots[i];
-      if (slot[0] === '__next__') continue;  // skip sentinel
+      if (slot[0] === '__next__' || slot[0] === '__prev__') continue;  // skip sentinels
       for (const it of slot) {
         if (this._realPage(it) === pageIdx) return i;
       }
@@ -3567,6 +3704,28 @@ class Reader {
     // following scrollToSlot() will reset this flag once it's done.
     this._programmaticScroll = true;
     container.innerHTML = this.slots.map((pageIndices, slotIdx) => {
+      // Sentinel slot for "prev volume" prompt at the very start
+      if (pageIndices[0] === '__prev__') {
+        const prev = this.prevFile;
+        const inner = prev
+          ? `
+            <div class="next-volume-card">
+              <div class="next-volume-thumb">
+                <div class="thumb-fallback"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg></div>
+                <img alt="" id="prev-vol-thumb" style="display:none">
+              </div>
+              <div class="next-volume-label">前の巻</div>
+              <div class="next-volume-name">${escapeHtml(prev.name)}</div>
+              <div class="next-volume-hint">もう一度めくると開きます</div>
+            </div>`
+          : `
+            <div class="next-volume-card">
+              <div class="next-volume-label">シリーズの最初</div>
+              <div class="next-volume-name">${escapeHtml(this.file.name)}</div>
+              <div class="next-volume-hint">これが最初の巻です</div>
+            </div>`;
+        return `<div class="page-slot next-slot prev-slot" data-slot="${slotIdx}"><div class="page-cell">${inner}</div></div>`;
+      }
       // Sentinel slot for "next volume" prompt at the very end
       if (pageIndices[0] === '__next__') {
         const next = this.nextFile;
@@ -3618,6 +3777,20 @@ class Reader {
         });
       }
     }
+    // Same for the prev-volume sentinel thumbnail. We scope the fallback
+    // query to the prev-slot specifically so we don't accidentally match
+    // the next-slot's fallback element (same class names).
+    if (this.prevFile) {
+      const img = $('prev-vol-thumb');
+      if (img) {
+        loadThumbnail(this.prevFile, img, { force: true }).then(url => {
+          if (this.cancelled || !url) return;
+          const prevSlot = container.querySelector('.prev-slot');
+          const fallback = prevSlot && prevSlot.querySelector('.next-volume-thumb .thumb-fallback');
+          if (fallback) fallback.style.display = 'none';
+        });
+      }
+    }
 
     if (this._scrollHandler) container.removeEventListener('scroll', this._scrollHandler);
     this._scrollHandler = () => {
@@ -3654,6 +3827,10 @@ class Reader {
     const total = this.imageEntries.length;
     if (slot[0] === '__next__') {
       $('page-counter').textContent = this.nextFile ? '次の巻 →' : '完結';
+      return;
+    }
+    if (slot[0] === '__prev__') {
+      $('page-counter').textContent = this.prevFile ? '← 前の巻' : '最初の巻';
       return;
     }
     // Map slot entries to real page indices for the counter. In split mode,
@@ -3708,6 +3885,14 @@ class Reader {
   }
 
   prev() {
+    // If we're already on the prev-volume sentinel, the user is trying to
+    // page past it — that's the trigger to open the previous volume.
+    const cur = this.slots[this.currentSlotIndex];
+    if (cur && cur[0] === '__prev__' && this.prevFile && !this._advanced) {
+      this._advanced = true;
+      this.advanceToPrev();
+      return;
+    }
     if (this.currentSlotIndex > 0) {
       this.currentSlotIndex--;
       this.scrollToSlot(this.currentSlotIndex);
@@ -3734,6 +3919,23 @@ class Reader {
     openZip(next, nextCtx);
   }
 
+  // Mirror of advanceToNext: open the previous volume. The new Reader will
+  // also detect its own next/prev volumes, so the user can walk in either
+  // direction through the series.
+  advanceToPrev() {
+    if (!this.prevFile) return;
+    const prev = this.prevFile;
+    let prevCtx = null;
+    if (this.seriesCtx && this.seriesCtx.siblings) {
+      const newIdx = this.seriesCtx.siblings.findIndex(f => f.id === prev.id);
+      if (newIdx >= 0) {
+        prevCtx = { siblings: this.seriesCtx.siblings, index: newIdx };
+      }
+    }
+    toast(`前の巻: ${prev.name}`, 1500);
+    openZip(prev, prevCtx);
+  }
+
   // Run after currentSlotIndex changes from any path (keyboard, tap, swipe,
   // view mode/pair offset toggle). Centralizes the work so preload + progress
   // save can't be forgotten by one of the call sites.
@@ -3743,7 +3945,7 @@ class Reader {
     this.updateThumbStripCurrent();
     this.preload();
     const slot = this.slots[this.currentSlotIndex];
-    if (slot && slot[0] !== '__next__') {
+    if (slot && slot[0] !== '__next__' && slot[0] !== '__prev__') {
       const realPage = this._realPage(slot[0]);
       if (realPage !== null) {
         setProgress(this.file.id, realPage);
@@ -4261,7 +4463,7 @@ class Reader {
     const strip = $('thumb-strip');
     if (!strip) return;
     const slot = this.slots[this.currentSlotIndex];
-    if (!slot || slot[0] === '__next__') return;
+    if (!slot || slot[0] === '__next__' || slot[0] === '__prev__') return;
     const currentPage = this._realPage(slot[0]);
     if (currentPage == null) return;
     let currentEl = null;
@@ -4954,12 +5156,16 @@ function wireReader() {
   // Left third → next (RTL advance), middle → toggle overlay, right third → prev.
   $('reader-pages').addEventListener('click', (e) => {
     if (!state.reader) return;
-    // On the next-volume sentinel slot, any tap (including the middle area)
-    // advances to the next volume. Otherwise the user would have to find
-    // the left third — confusing on a "press to continue" prompt.
+    // On the next-volume or prev-volume sentinel slot, any tap (including
+    // the middle area) opens that volume. Otherwise the user would have to
+    // find a specific edge — confusing on a "press to continue" prompt.
     const cur = state.reader.slots[state.reader.currentSlotIndex];
     if (cur && cur[0] === '__next__') {
       state.reader.next();
+      return;
+    }
+    if (cur && cur[0] === '__prev__') {
+      state.reader.prev();
       return;
     }
     const rect = e.currentTarget.getBoundingClientRect();
