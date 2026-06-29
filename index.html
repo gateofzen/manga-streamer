@@ -845,37 +845,105 @@ async function hydrateFolderPeekCache(folderIds) {
   } catch {}
 }
 
+// In-flight peek promises, keyed by folderId. Lets concurrent callers
+// (e.g. background refresh of multiple top-level folders that share a
+// sub-tree) coalesce onto a single Drive request per folder.
+const _folderPeekInflight = new Map();
+
+// Walk a folder's tree to find the most recently modified FILE inside it.
+// Returns an ISO 8601 timestamp string (empty if no files found).
+//
+// This is needed because Google Drive's folder.modifiedTime only updates
+// when the folder's own metadata changes (rename, move, share) — adding a
+// file inside does NOT bump it. So a shallow "max(direct children's
+// modifiedTime)" misses recent files that live inside a sub-folder whose
+// own modifiedTime is older.
+//
+// Strategy:
+//   1. List ALL direct children of `folderId` with id/mimeType/modifiedTime
+//   2. Among non-folder children, take the max modifiedTime — these are
+//      reliable (file modifiedTime updates correctly on every change).
+//   3. For each direct subfolder, recurse (up to maxDepth) and fold its
+//      result into the max.
+//
+// Cost is bounded by maxDepth and the Drive concurrency gate. Results are
+// cached aggressively (in-memory + IndexedDB) so subsequent calls are
+// instant. Background refresh re-validates with bypassCache=true.
 async function peekFolderModified(folderId, opts = {}) {
-  // bypassCache=true forces a fresh Drive query (used by background
-  // refresh to detect newly-added content even when the cache says
-  // it knows the answer).
-  if (!opts.bypassCache && _folderPeekCache.has(folderId)) {
+  const useCache = !opts.bypassCache;
+  if (useCache && _folderPeekCache.has(folderId)) {
     return _folderPeekCache.get(folderId);
   }
-  const params = new URLSearchParams({
-    q: `'${folderId}' in parents and trashed = false`,
-    fields: 'files(modifiedTime)',
-    pageSize: '1',
-    orderBy: 'modifiedTime desc',
-    spaces: 'drive',
-    supportsAllDrives: 'true',
-    includeItemsFromAllDrives: 'true',
-  });
-  try {
-    const resp = await driveFetch('https://www.googleapis.com/drive/v3/files?' + params, { priority: 2 });
-    if (!resp.ok) {
-      if (!opts.bypassCache) _folderPeekCache.set(folderId, '');
-      return '';
-    }
-    const data = await readBodyJson(resp);
-    const ts = (data.files && data.files[0] && data.files[0].modifiedTime) || '';
-    _folderPeekCache.set(folderId, ts);
-    if (ts) putCachedFolderPeek(folderId, ts);  // fire and forget
-    return ts;
-  } catch {
-    if (!opts.bypassCache) _folderPeekCache.set(folderId, '');
-    return '';
+  if (useCache && _folderPeekInflight.has(folderId)) {
+    return _folderPeekInflight.get(folderId);
   }
+
+  const maxDepth = opts.maxDepth ?? 1;
+
+  const promise = (async () => {
+    let maxTs = '';
+    try {
+      const params = new URLSearchParams({
+        q: `'${folderId}' in parents and trashed = false`,
+        fields: 'files(id,modifiedTime,mimeType)',
+        pageSize: '1000',
+        spaces: 'drive',
+        supportsAllDrives: 'true',
+        includeItemsFromAllDrives: 'true',
+      });
+      const resp = await driveFetch(
+        'https://www.googleapis.com/drive/v3/files?' + params,
+        { priority: 2 }
+      );
+      if (resp.ok) {
+        const data = await readBodyJson(resp);
+        const children = data.files || [];
+
+        const subfolders = [];
+        for (const c of children) {
+          if (c.mimeType === 'application/vnd.google-apps.folder') {
+            subfolders.push(c);
+          } else if (c.modifiedTime && c.modifiedTime > maxTs) {
+            maxTs = c.modifiedTime;
+          }
+        }
+
+        // Recurse into subfolders. Each recursion is bounded by maxDepth-1
+        // so a typical depth-1 call only goes one level deeper than the
+        // current peek. Sub-results are awaited in parallel; the global
+        // Drive gate ensures we never have more than 4 requests in flight
+        // across the whole app.
+        if (maxDepth > 0 && subfolders.length) {
+          const subTimes = await Promise.all(subfolders.map(sf =>
+            peekFolderModified(sf.id, {
+              maxDepth: maxDepth - 1,
+              bypassCache: opts.bypassCache,
+            })
+          ));
+          for (const t of subTimes) {
+            if (t && t > maxTs) maxTs = t;
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('[peekFolder]', folderId, 'failed:', e);
+    }
+
+    // Update caches BEFORE clearing inflight to avoid a race where a
+    // concurrent caller observes "no inflight, no cache" and starts a
+    // duplicate Drive query right before we finish writing the cache.
+    if (useCache) {
+      _folderPeekCache.set(folderId, maxTs);
+      _folderPeekInflight.delete(folderId);
+    }
+    // Persist to IndexedDB (fire and forget) — even empty results so
+    // future sessions can skip the lookup for known-empty folders.
+    if (maxTs) putCachedFolderPeek(folderId, maxTs);
+    return maxTs;
+  })();
+
+  if (useCache) _folderPeekInflight.set(folderId, promise);
+  return promise;
 }
 
 async function enrichFolderModifiedTimes(files) {
@@ -2826,6 +2894,12 @@ function backgroundRefreshFolderPeeks(files, token, onUpdate) {
     else neverPeeked.push(f);
   }
 
+  // Light up the sync indicator while we refresh. Folder peeks now recurse
+  // into subfolders (see peekFolderModified), so the work can take several
+  // seconds on first visit to a deep library. The dot tells the user the
+  // order is still being refined.
+  showSync(true);
+
   let updatesSinceRender = 0;
   let firstUpdate = true;
   let renderTimer = null;
@@ -2853,27 +2927,27 @@ function backgroundRefreshFolderPeeks(files, token, onUpdate) {
   // PASS 1: peek never-seen folders immediately. They're currently being
   // displayed with raw modifiedTime (folder metadata time, which can be
   // wildly wrong), so getting real values matters.
-  Promise.all(neverPeeked.map(async f => {
+  const pass1 = Promise.all(neverPeeked.map(async f => {
     const ts = await peekFolderModified(f.id);
     applyResult(f, ts);
-  })).then(() => {
+  }));
+  // PASS 2 starts after pass1 completes — runs in parallel, bypassing
+  // the cache to detect newly-added content in folders we'd seen before.
+  const pass2 = pass1.then(() => {
     if (token !== state._folderLoadToken) return;
-    // PASS 2: re-peek cached folders, bypassing the cache, so newly-added
-    // files are reflected. Lower priority than PASS 1, runs sequentially
-    // in batches to avoid swamping the Drive gate. The initial render
-    // already showed cached values which are correct for the common case
-    // where nothing changed — this pass only matters when files HAVE
-    // been added since the last peek.
-    cached.forEach(f => {
-      // Small async delay so PASS 1's renders settle before we start
-      // generating more.
-      peekFolderModified(f.id, { bypassCache: true }).then(ts => applyResult(f, ts));
-    });
+    return Promise.all(cached.map(f =>
+      peekFolderModified(f.id, { bypassCache: true })
+        .then(ts => applyResult(f, ts))
+    ));
   });
-
-  // Final render to catch any trailing updates after all peeks complete.
-  // (Both passes' applyResult calls go through scheduleRender, so the
-  // batching is consistent.)
+  // When everything settles, turn off the sync indicator and force one
+  // last render to catch any trailing batched updates.
+  pass2.finally(() => {
+    if (token !== state._folderLoadToken) return;
+    if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
+    if (updatesSinceRender > 0) onUpdate();
+    showSync(false);
+  });
 }
 
 async function runSearch(query) {
