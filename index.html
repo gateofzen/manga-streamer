@@ -1432,6 +1432,64 @@ function _driveRelease(p) {
 // mode was replaced by the instant prefetch wave.
 function setDriveCritical(on) { /* no-op */ }
 
+// Diagnostic helper. Run `mangaStreamerDebug()` in the browser Console
+// to dump the current auth + sync state. Useful for troubleshooting
+// "why isn't sync working between my devices" scenarios where the
+// underlying cause is usually: different Google accounts signed in,
+// different OAuth client IDs, or a missing scope grant.
+window.mangaStreamerDebug = async function() {
+  const info = {
+    // Auth material in localStorage
+    hasClientId: !!localStorage.getItem(STORAGE_CLIENT_ID),
+    clientIdSuffix: (() => {
+      const cid = localStorage.getItem(STORAGE_CLIENT_ID) || '';
+      return cid ? '...' + cid.slice(-24) : null;
+    })(),
+    hasClientSecret: !!localStorage.getItem(STORAGE_CLIENT_SECRET),
+    hasStoredAccessToken: !!localStorage.getItem(STORAGE_TOKEN),
+    hasStoredRefreshToken: !!localStorage.getItem(STORAGE_REFRESH_TOKEN),
+    accessTokenExpiresIn: state.tokenExpiresAt
+      ? Math.round((state.tokenExpiresAt - Date.now()) / 1000) + 's'
+      : 'no token in memory',
+    // Sync state
+    progressFileId: state.progressFileId || '(not initialized)',
+    bookCountLocal: Object.keys(state.progress.files || {}).length,
+  };
+
+  // Ask Google what account this token belongs to and what scopes it has.
+  // Requires a valid access token — if there is none, this section is skipped.
+  if (state.accessToken) {
+    try {
+      const resp = await fetch(
+        'https://www.googleapis.com/oauth2/v3/tokeninfo?access_token=' + state.accessToken
+      );
+      if (resp.ok) {
+        const t = await resp.json();
+        info.googleEmail = t.email;
+        info.grantedScopes = t.scope;
+        info.hasDriveReadonlyScope = t.scope && t.scope.includes('drive.readonly');
+        info.hasDriveAppdataScope = t.scope && t.scope.includes('drive.appdata');
+      } else {
+        info.tokenInfoError = 'HTTP ' + resp.status;
+      }
+    } catch (e) {
+      info.tokenInfoError = e.message;
+    }
+  }
+
+  console.log('%c=== Manga Streamer Diagnostic ===', 'color:#ff4d4d;font-weight:bold');
+  console.log(info);
+  console.log('%c=================================', 'color:#ff4d4d;font-weight:bold');
+
+  if (info.hasDriveAppdataScope === false) {
+    console.warn('%c⚠ drive.appdata scope is MISSING — cross-device progress sync will fail. ' +
+      'Sign out and sign back in, and check ALL scope checkboxes in the consent screen.',
+      'color:#ff4d4d;font-weight:bold');
+  }
+
+  return info;
+};
+
 function ensureToken() {
   if (state.accessToken && Date.now() < state.tokenExpiresAt) return Promise.resolve();
   if (_tokenRefreshPromise) return _tokenRefreshPromise;
@@ -1855,16 +1913,20 @@ let saveTimer = null;
 let savePromise = null;
 
 async function initProgressSync() {
+  console.log('[sync] Initializing progress sync');
   showSync(true);
   try {
     state.progressFileId = await findProgressFile();
+    console.log('[sync] Progress file ID:', state.progressFileId || '(will create new)');
 
     if (state.progressFileId) {
       try {
         const data = await readProgressFile(state.progressFileId);
         state.progress = (data && data.files) ? data : { version: 1, files: {} };
+        console.log('[sync] Loaded from cloud:',
+          Object.keys(state.progress.files).length, 'books tracked');
       } catch (e) {
-        console.warn('Could not read progress file, starting fresh:', e);
+        console.warn('[sync] Could not read progress file, starting fresh:', e);
         state.progress = { version: 1, files: {} };
       }
     } else {
@@ -1873,12 +1935,16 @@ async function initProgressSync() {
 
     // Migrate any localStorage progress (legacy + mirror) into cloud
     const merged = mergeLocalIntoCloud();
+    if (merged) {
+      console.log('[sync] Merged local mirror into cloud state');
+    }
 
     if (!state.progressFileId) {
       try {
         state.progressFileId = await createProgressFile(state.progress);
+        console.log('[sync] Created new progress file:', state.progressFileId);
       } catch (e) {
-        console.warn('Could not create cloud progress file:', e);
+        console.warn('[sync] Could not create cloud progress file:', e);
       }
     } else if (merged) {
       scheduleProgressSave();
@@ -2042,42 +2108,47 @@ function flushProgressKeepalive() {
 }
 
 async function refreshProgress() {
-  if (!state.progressFileId) return;
+  if (!state.progressFileId) {
+    console.warn('[sync] refreshProgress: no progress file ID');
+    return;
+  }
+  console.log('[sync] Refreshing progress from cloud');
   showSync(true);
   try {
     const data = await readProgressFile(state.progressFileId);
     if (data && data.files) {
-      // MERGE rather than overwrite. For each book, keep whichever record
-      // has the newer `updated` timestamp. This protects progress made on
-      // THIS device that hasn't been flushed to Drive yet (e.g. a keepalive
-      // save that failed because the token had expired) from being clobbered
-      // by an older cloud value when we come back to the foreground.
       const localFiles = state.progress.files || {};
       const cloudFiles = data.files || {};
+      console.log('[sync] Cloud has', Object.keys(cloudFiles).length,
+        'books, local has', Object.keys(localFiles).length);
       const mergedFiles = {};
       const allIds = new Set([
         ...Object.keys(localFiles),
         ...Object.keys(cloudFiles),
       ]);
       let localHadNewer = false;
+      let cloudNewerCount = 0;
       for (const id of allIds) {
         const local = localFiles[id];
         const cloud = cloudFiles[id];
         if (!cloud) { mergedFiles[id] = local; localHadNewer = true; continue; }
-        if (!local) { mergedFiles[id] = cloud; continue; }
-        // Both exist — take the newer by `updated`.
+        if (!local) { mergedFiles[id] = cloud; cloudNewerCount++; continue; }
         if ((local.updated || 0) > (cloud.updated || 0)) {
           mergedFiles[id] = local;
           localHadNewer = true;
         } else {
           mergedFiles[id] = cloud;
+          if ((cloud.updated || 0) > (local.updated || 0)) cloudNewerCount++;
         }
       }
+      console.log('[sync] Merged:', Object.keys(mergedFiles).length,
+        'books total; cloud contributed newer:', cloudNewerCount,
+        '; local had newer:', localHadNewer);
       state.progress = { version: data.version || 1, files: mergedFiles };
       saveLocalMirror();
-      // If our local state contributed newer records, push the merged
-      // result back to the cloud so the other device sees them too.
       if (localHadNewer) scheduleProgressSave();
+    } else {
+      console.warn('[sync] Cloud read returned no data or no files');
     }
   } catch (e) {
     console.warn('Progress refresh failed:', e);
