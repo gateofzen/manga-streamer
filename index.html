@@ -478,6 +478,62 @@
      would open the overlay in the first place). */
   #reader-bottom-overlay.hidden-overlay > * { pointer-events: none; }
 
+  /* Debug modal */
+  #debug-modal {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.85);
+    z-index: 300;
+    display: flex; align-items: center; justify-content: center;
+    padding: 20px;
+  }
+  .debug-modal-content {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    max-width: 600px;
+    width: 100%;
+    max-height: 90vh;
+    display: flex; flex-direction: column;
+    gap: 12px;
+  }
+  .debug-modal-content h3 {
+    margin: 0; font-size: 16px; color: var(--text);
+  }
+  #debug-output {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    padding: 12px;
+    border-radius: 6px;
+    font-family: ui-monospace, monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--text);
+    white-space: pre-wrap;
+    word-break: break-all;
+    overflow-y: auto;
+    flex: 1;
+    min-height: 200px;
+    margin: 0;
+    user-select: text;
+    -webkit-user-select: text;
+  }
+  .debug-modal-actions {
+    display: flex; gap: 8px;
+  }
+  .debug-modal-actions button {
+    flex: 1; padding: 10px 12px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .debug-modal-actions button:hover {
+    background: var(--border);
+  }
+
   /* Toast */
   #toast {
     position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
@@ -559,6 +615,13 @@
         <circle cx="11" cy="11" r="8"/><path d="M21 21l-4.3-4.3"/>
       </svg>
     </button>
+    <button class="icon-btn" id="debug-btn" title="診断情報">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="10"/>
+        <line x1="12" y1="16" x2="12" y2="12"/>
+        <line x1="12" y1="8" x2="12.01" y2="8"/>
+      </svg>
+    </button>
     <button class="icon-btn" id="signout-btn" title="Sign out">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/>
@@ -598,6 +661,18 @@
       <input id="page-jump-input" type="number" min="1" inputmode="numeric" pattern="[0-9]*">
       <span class="total" id="page-jump-total">/ 0</span>
       <button id="page-jump-btn">移動</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== Debug modal ===== -->
+<div id="debug-modal" class="hidden">
+  <div class="debug-modal-content">
+    <h3>診断情報</h3>
+    <pre id="debug-output">読み込み中...</pre>
+    <div class="debug-modal-actions">
+      <button id="debug-copy-btn">クリップボードにコピー</button>
+      <button id="debug-close-btn">閉じる</button>
     </div>
   </div>
 </div>
@@ -5544,9 +5619,62 @@ async function autoSignIn() {
   }, 5000);
 }
 
+// Open the diagnostic modal and populate with current auth + sync state.
+// Same info as mangaStreamerDebug() but rendered on-screen for devices
+// (like Android tablets) where opening the JS Console is inconvenient.
+async function openDebugModal() {
+  const modal = $('debug-modal');
+  const output = $('debug-output');
+  output.textContent = '読み込み中...';
+  modal.classList.remove('hidden');
+  try {
+    const info = await mangaStreamerDebug();
+    // Also include the raw progress mirror for completeness — but only
+    // metadata (count, IDs), not the actual page positions of every book
+    // to keep the payload small.
+    info._environment = {
+      userAgent: navigator.userAgent,
+      url: location.origin + location.pathname,
+      timestamp: new Date().toISOString(),
+    };
+    output.textContent = JSON.stringify(info, null, 2);
+  } catch (e) {
+    output.textContent = 'Error: ' + e.message;
+  }
+}
+
+function closeDebugModal() {
+  $('debug-modal').classList.add('hidden');
+}
+
+async function copyDebugInfo() {
+  const text = $('debug-output').textContent;
+  try {
+    await navigator.clipboard.writeText(text);
+    toast('コピーしました', 1500);
+  } catch (e) {
+    // Fallback for browsers/contexts without clipboard API — select the
+    // text so the user can long-press → Copy manually. Common on older
+    // mobile browsers.
+    const range = document.createRange();
+    range.selectNodeContents($('debug-output'));
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    toast('選択しました — 長押しでコピーしてください', 2500);
+  }
+}
+
 function wireBrowser() {
   $('back-btn').addEventListener('click', navBack);
   $('signout-btn').addEventListener('click', signOut);
+  $('debug-btn').addEventListener('click', openDebugModal);
+  $('debug-close-btn').addEventListener('click', closeDebugModal);
+  $('debug-copy-btn').addEventListener('click', copyDebugInfo);
+  // Also close the modal when tapping the dark overlay outside the content box.
+  $('debug-modal').addEventListener('click', (e) => {
+    if (e.target.id === 'debug-modal') closeDebugModal();
+  });
   updateSortButton();
 
   $('sort-btn').addEventListener('click', async () => {
