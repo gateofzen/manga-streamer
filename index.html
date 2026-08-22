@@ -3152,24 +3152,112 @@ function parseSeriesAndVolume(filename) {
 // name. We strip leading author/scanlator tags then pick the longest token.
 function searchKeywordForSeries(series) {
   // Strip bracket tags first — author tags shouldn't drive the search
-  const cleaned = (series || '').replace(/[\[\(（【].*?[\]\)）】]/g, ' ').trim();
+  const cleaned = _stripBrackets(series || '');
   // Try to grab the longest contiguous run of CJK or word characters
   const tokens = cleaned.match(/[\p{L}\p{N}]+/gu) || [];
   if (!tokens.length) return cleaned;
   return tokens.sort((a, b) => b.length - a.length)[0];
 }
 
+// Strip common bracket-enclosed groups: author/scanlator/translator tags.
+// Handles the wide variety of bracket characters that show up in manga
+// filenames across scanners: ASCII, full-width, Japanese black brackets,
+// angle brackets, and Japanese quotation marks.
+function _stripBrackets(s) {
+  return s.replace(
+    /[\[\(（【〈《「『<].*?[\]\)）】〉》」』>]/g,
+    ' '
+  );
+}
+
 // Normalize a series string for loose equality matching across filenames.
 // Lowercases, strips whitespace/zenkaku-spaces, and drops common separator
-// characters that vary between scanners. Also strips leading bracket tags
-// like "[author]" or "(scanlator)" so files with different tags but the
-// same series still match.
+// characters that vary between scanners. Also strips bracket tags like
+// "[author]" or "(scanlator)" so files with different tags but the same
+// series still match.
 function _normSeries(s) {
-  return (s || '')
-    // remove any [..] or (..) groups (often author/scanlator/translator)
-    .replace(/[\[\(（【].*?[\]\)）】]/g, ' ')
+  return _stripBrackets(s || '')
     .toLowerCase()
-    .replace(/[\s\u3000_\-―〜~・]+/g, '');
+    .replace(/[\s\u3000_\-―〜~・.,]+/g, '');
+}
+
+// Extract the "meaningful tokens" from a series name for fuzzy comparison.
+// Used as a fallback when strict normalized-string match fails — helpful
+// when different files in the same series have differently-formatted
+// author info OUTSIDE brackets (e.g. "作者A_タイトル_v01" vs "作者B_タイトル_v02").
+// Returns tokens sorted by length descending (longest first).
+function _seriesTokens(series) {
+  const cleaned = _stripBrackets(series || '');
+  const tokens = cleaned.match(/[\p{L}\p{N}]+/gu) || [];
+  return tokens
+    .filter(t => {
+      // Keep tokens meaningful enough to identify a series. CJK is
+      // information-dense so 2 chars is fine; Latin needs at least 3
+      // to avoid matching things like "a", "of", "vol".
+      const isCJK = /[\u3000-\u9fff\uac00-\ud7af]/.test(t);
+      return isCJK ? t.length >= 2 : t.length >= 3;
+    })
+    .sort((a, b) => b.length - a.length);
+}
+
+// True if two token sets look like they came from the same series.
+// The heuristic: their LONGEST token must match (case-insensitive). The
+// longest token is almost always the actual title (authors/scanlator
+// tags are shorter and, in many filename conventions, appear before the
+// title as prefixes).
+function _seriesTokensMatch(tokensA, tokensB) {
+  if (!tokensA.length || !tokensB.length) return false;
+  const a = tokensA[0].toLowerCase();
+  const b = tokensB[0].toLowerCase();
+  return a === b;
+}
+
+// Match `candidates` against the current file's parsed series. First tries
+// a STRICT match (normalized full-string equality). If that yields nothing,
+// falls back to a FUZZY match based on the longest significant token —
+// helpful when scanners format the author name differently in each volume
+// ("作者A_タイトル_v01" vs "作者B_タイトル_v02" where the title matches
+// but the author outside brackets doesn't survive normalization).
+//
+// Returns the filtered list of {file, parsed} tuples with the requested
+// volume direction ('next' returns vol > current, 'prev' returns vol < current).
+function _matchVolumeCandidates(candidates, parsedCurrent, direction) {
+  const wantHigher = direction === 'next';
+  const target = _normSeries(parsedCurrent.series);
+  const targetTokens = _seriesTokens(parsedCurrent.series);
+
+  // Pre-parse candidates so we don't re-parse them in each pass.
+  const parsedCands = [];
+  for (const f of candidates) {
+    const p = parseSeriesAndVolume(f.name);
+    if (!p) continue;
+    const rightDirection = wantHigher
+      ? p.volume > parsedCurrent.volume
+      : p.volume < parsedCurrent.volume;
+    if (!rightDirection) continue;
+    parsedCands.push({ file: f, parsed: p });
+  }
+
+  // Pass 1: strict normalized-string match. Fastest and least ambiguous.
+  const strict = parsedCands.filter(c => _normSeries(c.parsed.series) === target);
+  if (strict.length) {
+    console.log('[volume-search] strict match found', strict.length, 'candidates for', direction);
+    return strict;
+  }
+
+  // Pass 2: fuzzy token match. Only consider candidates whose longest
+  // significant token matches ours. Guards against wildly different
+  // series with the same tokens by requiring the token to be at least
+  // 2 CJK chars or 3 Latin chars (see _seriesTokens).
+  const fuzzy = parsedCands.filter(c => {
+    const cTokens = _seriesTokens(c.parsed.series);
+    return _seriesTokensMatch(targetTokens, cTokens);
+  });
+  if (fuzzy.length) {
+    console.log('[volume-search] FUZZY match found', fuzzy.length, 'candidates for', direction,
+      '(target longest token:', targetTokens[0] || '(none)', ')');
+  }
+  return fuzzy;
 }
 
 // Pick the best "next volume" from a list of candidate files (already
@@ -3178,17 +3266,9 @@ function _normSeries(s) {
 // is the next-highest. Within ties, smaller volume wins (closer to current).
 function _pickNextVolume(candidates, parsedCurrent) {
   if (!parsedCurrent) return null;
-  const target = _normSeries(parsedCurrent.series);
-  const matches = [];
-  for (const f of candidates) {
-    const p = parseSeriesAndVolume(f.name);
-    if (!p) continue;
-    if (_normSeries(p.series) !== target) continue;
-    if (p.volume <= parsedCurrent.volume) continue;
-    matches.push({ file: f, volume: p.volume });
-  }
+  const matches = _matchVolumeCandidates(candidates, parsedCurrent, 'next');
   if (!matches.length) return null;
-  matches.sort((a, b) => a.volume - b.volume);
+  matches.sort((a, b) => a.parsed.volume - b.parsed.volume);
   return matches[0].file;
 }
 
@@ -3198,18 +3278,10 @@ function _pickNextVolume(candidates, parsedCurrent) {
 // without leaving the reader.
 function _pickPrevVolume(candidates, parsedCurrent) {
   if (!parsedCurrent) return null;
-  const target = _normSeries(parsedCurrent.series);
-  const matches = [];
-  for (const f of candidates) {
-    const p = parseSeriesAndVolume(f.name);
-    if (!p) continue;
-    if (_normSeries(p.series) !== target) continue;
-    if (p.volume >= parsedCurrent.volume) continue;
-    matches.push({ file: f, volume: p.volume });
-  }
+  const matches = _matchVolumeCandidates(candidates, parsedCurrent, 'prev');
   if (!matches.length) return null;
   // Highest volume below current = "immediately previous".
-  matches.sort((a, b) => b.volume - a.volume);
+  matches.sort((a, b) => b.parsed.volume - a.parsed.volume);
   return matches[0].file;
 }
 
@@ -3218,12 +3290,32 @@ function _pickPrevVolume(candidates, parsedCurrent) {
 // keyword. Returns a list of File records (excluding currentFile itself).
 // Used by both findNextVolumeInDrive and findPrevVolumeInDrive; sharing
 // this avoids paying the Drive RTT cost twice.
+// Session-level cache for volume search results. Keyed by normalized series
+// name. Two subsequent openings of vols from the same series (which happens
+// constantly — advanceToNext / advanceToPrev flow through the sentinel
+// sentinel cards) now skip the Drive round-trip entirely. TTL is short so
+// newly-uploaded volumes are picked up within a few minutes.
+const _volumeCandidateCache = new Map();  // seriesKey → { at, candidates }
+const VOLUME_CANDIDATE_TTL_MS = 3 * 60 * 1000;
+
 async function _gatherVolumeCandidates(currentFile, parsed) {
+  const cacheKey = _normSeries(parsed.series);
+  const cached = _volumeCandidateCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < VOLUME_CANDIDATE_TTL_MS) {
+    console.log('[volume-search] cache HIT for series:', cacheKey,
+      '(', cached.candidates.length, 'candidates)');
+    // Return a filtered copy — the cached list may contain currentFile
+    // if we're re-searching from a different volume of the same series.
+    return cached.candidates.filter(f => f.id !== currentFile.id);
+  }
+
+  const t0 = Date.now();
+
   // Try two Drive search keywords. The first (cleaned full series name) is
   // more specific but Drive's `name contains` is token-based and may fail
   // on exact-string matches with mixed scripts; the second (longest token)
   // is a looser fallback. We merge results and dedupe.
-  const cleanedSeries = parsed.series.replace(/[\[\(（【].*?[\]\)）】]/g, ' ').trim();
+  const cleanedSeries = _stripBrackets(parsed.series).trim();
   const tokenKeyword = searchKeywordForSeries(parsed.series);
   const queries = [];
   if (cleanedSeries && cleanedSeries.length >= 2) queries.push(cleanedSeries);
@@ -3243,7 +3335,8 @@ async function _gatherVolumeCandidates(currentFile, parsed) {
       let parentIds = currentFile.parents;
       if (!parentIds || !parentIds.length) {
         const resp = await driveFetch(
-          `https://www.googleapis.com/drive/v3/files/${currentFile.id}?fields=parents&supportsAllDrives=true`
+          `https://www.googleapis.com/drive/v3/files/${currentFile.id}?fields=parents&supportsAllDrives=true`,
+          { priority: 1 }  // Bumped: prev/next-vol search is user-visible
         );
         if (resp.ok) {
           const data = await readBodyJson(resp);
@@ -3261,7 +3354,27 @@ async function _gatherVolumeCandidates(currentFile, parsed) {
     }
   })();
 
-  // Run text searches in parallel with the parent-folder listing.
+  // FAST PATH: wait for parent listing first. If it returned enough
+  // candidates in the same series, skip the (expensive) Drive-wide text
+  // search entirely. Well-organized libraries where each series lives in
+  // its own folder get answered from a SINGLE Drive request this way.
+  const parentSiblings = await parentListPromise;
+  const target = _normSeries(parsed.series);
+  const parentMatches = parentSiblings.filter(f => {
+    if (!isZip(f) || f.id === currentFile.id) return false;
+    const p = parseSeriesAndVolume(f.name);
+    return p && _normSeries(p.series) === target;
+  });
+
+  const FAST_PATH_THRESHOLD = 3;  // If parent has ≥ this many series matches, don't search Drive
+  if (parentMatches.length >= FAST_PATH_THRESHOLD) {
+    console.log('[volume-search] FAST PATH: parent folder has', parentMatches.length,
+      'siblings, skipping Drive text search (', Date.now() - t0, 'ms )');
+    _volumeCandidateCache.set(cacheKey, { at: Date.now(), candidates: parentMatches });
+    return parentMatches;
+  }
+
+  // SLOW PATH: also do Drive-wide text searches. These run in parallel.
   const searchPromises = queries.map(async q => {
     try { return await searchDrive(q); }
     catch (e) {
@@ -3269,11 +3382,7 @@ async function _gatherVolumeCandidates(currentFile, parsed) {
       return [];
     }
   });
-
-  const [parentSiblings, ...searchResults] = await Promise.all([
-    parentListPromise,
-    ...searchPromises,
-  ]);
+  const searchResults = await Promise.all(searchPromises);
 
   // Merge + dedupe by file id, keep ZIPs only, exclude current file.
   // Parent-folder siblings are added first because they're the most
@@ -3289,7 +3398,11 @@ async function _gatherVolumeCandidates(currentFile, parsed) {
   };
   addAll(parentSiblings);
   for (const list of searchResults) addAll(list);
-  return [...byId.values()];
+  const merged = [...byId.values()];
+  console.log('[volume-search] full search:', merged.length, 'candidates in',
+    Date.now() - t0, 'ms (queries:', queries.join(' / '), ')');
+  _volumeCandidateCache.set(cacheKey, { at: Date.now(), candidates: merged });
+  return merged;
 }
 
 async function findNextVolumeInDrive(currentFile) {
