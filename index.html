@@ -701,8 +701,16 @@
 //   localStorage and the hash is stripped from the URL. Subsequent
 //   opens don't need the hash at all.
 //
-// Both methods only run when localStorage doesn't already have the value,
-// so once you've signed in once, neither is needed.
+// METHOD 3 — Cloudflare Worker proxy (MOST RELIABLE, RECOMMENDED):
+//   Set WORKER_URL below to a deployed Cloudflare Worker that holds
+//   the client_secret server-side. The browser never sees the secret
+//   and doesn't need it entered. Token refreshes go through the Worker,
+//   which is far more reliable than direct-to-Google calls with browser
+//   secrets: no client_secret exposure risk, no GitHub secret-scanning
+//   issues, no dependence on browser cookie policies.
+//   See worker.js in this repo for the Worker source.
+const WORKER_URL = 'https://manga-streamer-oauth.gateofzen.workers.dev/';   // e.g. 'https://manga-streamer-oauth.username.workers.dev'
+
 const DEFAULT_CLIENT_ID = '';       // METHOD 1: hardcoded Client ID
 const DEFAULT_CLIENT_SECRET = '';   // METHOD 1: hardcoded Client Secret
 
@@ -1233,31 +1241,59 @@ async function handlePKCECallback() {
   }
 
   try {
-    const body = new URLSearchParams({
-      code,
-      client_id: state.clientId,
-      grant_type: 'authorization_code',
-      redirect_uri: _pkceRedirectUri(),
-      code_verifier: verifier,
-    });
-    // Google's Web application OAuth client type requires client_secret in
-    // the token exchange even when PKCE is used. Include it when the user
-    // has provided one. For Desktop/installed app types this is optional
-    // and Google ignores it if the client isn't configured to require it.
-    if (state.clientSecret) {
-      body.set('client_secret', state.clientSecret);
+    let tokens;
+    if (WORKER_URL) {
+      // Route through the Cloudflare Worker. The browser sends only
+      // non-sensitive fields; the Worker adds client_id and client_secret
+      // from its own environment variables before forwarding to Google.
+      console.log('[pkce] Using Cloudflare Worker for token exchange');
+      const resp = await fetch(WORKER_URL.replace(/\/+$/, '') + '/token/exchange', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          code,
+          code_verifier: verifier,
+          redirect_uri: _pkceRedirectUri(),
+        }),
+      });
+      const respText = await resp.text();
+      if (!resp.ok) {
+        throw new Error('Worker exchange failed: ' + resp.status + ' ' + respText.substring(0, 300));
+      }
+      try { tokens = JSON.parse(respText); }
+      catch { throw new Error('Worker returned non-JSON: ' + respText.substring(0, 200)); }
+    } else {
+      // Direct-to-Google flow. Requires client_secret in the browser
+      // for Web application-type OAuth clients.
+      console.log('[pkce] Using direct Google token endpoint (no Worker configured)');
+      const body = new URLSearchParams({
+        code,
+        client_id: state.clientId,
+        grant_type: 'authorization_code',
+        redirect_uri: _pkceRedirectUri(),
+        code_verifier: verifier,
+      });
+      // Google's Web application OAuth client type requires client_secret in
+      // the token exchange even when PKCE is used. Include it when the user
+      // has provided one. For Desktop/installed app types this is optional
+      // and Google ignores it if the client isn't configured to require it.
+      if (state.clientSecret) {
+        body.set('client_secret', state.clientSecret);
+      }
+      const resp = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        body,
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      });
+      if (!resp.ok) {
+        const errText = await resp.text();
+        throw new Error(resp.status + ': ' + errText);
+      }
+      tokens = await resp.json();
     }
-    const resp = await fetch('https://oauth2.googleapis.com/token', {
-      method: 'POST',
-      body,
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    });
-    if (!resp.ok) {
-      const errText = await resp.text();
-      throw new Error(resp.status + ': ' + errText);
+    if (!tokens.access_token) {
+      throw new Error('No access_token in response: ' + JSON.stringify(tokens).substring(0, 200));
     }
-    const tokens = await resp.json();
-    if (!tokens.access_token) throw new Error('No access_token in response');
     state.accessToken = tokens.access_token;
     state.tokenExpiresAt = Date.now() + (tokens.expires_in - 60) * 1000;
     if (tokens.refresh_token) state.refreshToken = tokens.refresh_token;
@@ -1279,31 +1315,73 @@ async function handlePKCECallback() {
 // days, so it's important to publish the app.
 async function refreshAccessToken() {
   if (!state.refreshToken) throw new Error('No refresh token');
-  if (!state.clientId) throw new Error('No client ID');
-  const body = new URLSearchParams({
-    refresh_token: state.refreshToken,
-    client_id: state.clientId,
-    grant_type: 'refresh_token',
-  });
-  // Same as the code exchange: Web app clients require client_secret.
-  if (state.clientSecret) {
-    body.set('client_secret', state.clientSecret);
+  console.log('[refresh] Requesting new access token via refresh_token');
+  let resp;
+  let respText = '';
+  try {
+    if (WORKER_URL) {
+      // Route through Cloudflare Worker. Same as token exchange —
+      // the browser sends only the refresh_token; the Worker adds
+      // client_id and client_secret from its environment.
+      console.log('[refresh] Using Cloudflare Worker');
+      resp = await fetch(WORKER_URL.replace(/\/+$/, '') + '/token/refresh', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refresh_token: state.refreshToken }),
+      });
+    } else {
+      if (!state.clientId) throw new Error('No client ID');
+      console.log('[refresh] Using direct Google token endpoint');
+      const body = new URLSearchParams({
+        refresh_token: state.refreshToken,
+        client_id: state.clientId,
+        grant_type: 'refresh_token',
+      });
+      // Same as the code exchange: Web app clients require client_secret.
+      if (state.clientSecret) {
+        body.set('client_secret', state.clientSecret);
+      }
+      resp = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        body,
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      });
+    }
+  } catch (netErr) {
+    // Network-layer failure (no HTTP response). NEVER invalidate the
+    // refresh token for this — it's a transient connectivity issue.
+    console.error('[refresh] Network error:', netErr);
+    throw new Error('Network error during refresh: ' + netErr.message);
   }
-  const resp = await fetch('https://oauth2.googleapis.com/token', {
-    method: 'POST',
-    body,
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-  });
+
+  try { respText = await resp.text(); } catch {}
+
   if (!resp.ok) {
-    if (resp.status === 400 || resp.status === 401) {
-      // Refresh token is invalid or revoked — clear it so we don't
-      // keep retrying forever.
+    // Parse the error body to distinguish "the refresh token is really
+    // dead" (invalid_grant) from "Google is having a temporary issue"
+    // (rate limit, backend error, etc). Previously we invalidated the
+    // refresh token on ANY 400/401 which caused frequent re-auth when
+    // Google was just being flaky.
+    let errCode = '';
+    try {
+      const errJson = JSON.parse(respText);
+      errCode = errJson.error || '';
+    } catch {}
+    console.error('[refresh] Failed:', resp.status, errCode || respText.substring(0, 200));
+    // Only invalidate the refresh token when Google explicitly says
+    // it's no longer valid. Anything else — transient failure, retry
+    // (the next ensureToken call will try again).
+    if (errCode === 'invalid_grant') {
+      console.warn('[refresh] Refresh token is dead (invalid_grant) — clearing');
       state.refreshToken = null;
       saveStoredToken();
     }
-    throw new Error('Refresh failed: ' + resp.status);
+    throw new Error('Refresh failed: ' + resp.status + ' ' + (errCode || respText.substring(0, 200)));
   }
-  const tokens = await resp.json();
+
+  let tokens;
+  try { tokens = JSON.parse(respText); }
+  catch { throw new Error('Refresh response not JSON: ' + respText.substring(0, 200)); }
   if (!tokens.access_token) throw new Error('No access_token in refresh response');
   state.accessToken = tokens.access_token;
   state.tokenExpiresAt = Date.now() + (tokens.expires_in - 60) * 1000;
@@ -1311,6 +1389,8 @@ async function refreshAccessToken() {
   if (tokens.refresh_token) state.refreshToken = tokens.refresh_token;
   saveStoredToken();
   scheduleProactiveTokenRefresh();
+  console.log('[refresh] Success — new access token valid for',
+    Math.round(tokens.expires_in / 60), 'minutes');
 }
 
 //===========================================================================
@@ -1545,6 +1625,8 @@ window.mangaStreamerDebug = async function() {
       return cid ? '...' + cid.slice(-24) : null;
     })(),
     hasClientSecret: !!localStorage.getItem(STORAGE_CLIENT_SECRET),
+    usingWorker: !!WORKER_URL,
+    workerUrl: WORKER_URL || null,
     hasStoredAccessToken: !!localStorage.getItem(STORAGE_TOKEN),
     hasStoredRefreshToken: !!localStorage.getItem(STORAGE_REFRESH_TOKEN),
     accessTokenExpiresIn: state.tokenExpiresAt
