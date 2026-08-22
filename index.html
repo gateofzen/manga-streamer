@@ -1294,6 +1294,8 @@ async function handlePKCECallback() {
     if (!tokens.access_token) {
       throw new Error('No access_token in response: ' + JSON.stringify(tokens).substring(0, 200));
     }
+    console.log('[pkce] Token exchange OK. Fields received:', Object.keys(tokens).join(', '));
+    console.log('[pkce] refresh_token present:', !!tokens.refresh_token);
     state.accessToken = tokens.access_token;
     state.tokenExpiresAt = Date.now() + (tokens.expires_in - 60) * 1000;
     if (tokens.refresh_token) state.refreshToken = tokens.refresh_token;
@@ -1432,12 +1434,15 @@ function initTokenClient() {
 // effectively the same security model as a "remember me" cookie.
 function saveStoredToken() {
   try {
-    // Refresh token is stored separately — it's long-lived and independent
-    // of the access token's expiry cycle.
+    // Refresh token is long-lived and independent of access token cycle.
+    // IMPORTANT: only WRITE the refresh token; never REMOVE it here just
+    // because state.refreshToken happens to be empty at this moment. A
+    // token refresh response may legitimately omit refresh_token (Google
+    // rotates them infrequently), and clearing the stored one would force
+    // the user to re-authenticate on the next expiry. To explicitly wipe
+    // the refresh token, call signOut() or clear it directly.
     if (state.refreshToken) {
       localStorage.setItem(STORAGE_REFRESH_TOKEN, state.refreshToken);
-    } else {
-      localStorage.removeItem(STORAGE_REFRESH_TOKEN);
     }
     if (!state.accessToken || !state.tokenExpiresAt) {
       localStorage.removeItem(STORAGE_TOKEN);
