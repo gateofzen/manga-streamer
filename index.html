@@ -5,6 +5,15 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no,viewport-fit=cover">
 <meta name="theme-color" content="#0a0a0a">
 <title>Manga Streamer</title>
+<!-- PWA installability: manifest + icons + Apple touch icon fallback -->
+<link rel="manifest" href="./manifest.webmanifest">
+<link rel="icon" type="image/png" sizes="32x32" href="./favicon-32.png">
+<link rel="icon" type="image/png" sizes="192x192" href="./icon-192.png">
+<link rel="apple-touch-icon" href="./icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="MangaStreamer">
+<meta name="mobile-web-app-capable" content="yes">
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 <style>
   :root {
@@ -709,7 +718,7 @@
 //   secrets: no client_secret exposure risk, no GitHub secret-scanning
 //   issues, no dependence on browser cookie policies.
 //   See worker.js in this repo for the Worker source.
-const WORKER_URL = 'https://manga-streamer-oauth.gateofzen.workers.dev/';   // e.g. 'https://manga-streamer-oauth.username.workers.dev'
+const WORKER_URL = '';   // e.g. 'https://manga-streamer-oauth.username.workers.dev'
 
 const DEFAULT_CLIENT_ID = '';       // METHOD 1: hardcoded Client ID
 const DEFAULT_CLIENT_SECRET = '';   // METHOD 1: hardcoded Client Secret
@@ -6179,6 +6188,22 @@ window.addEventListener('DOMContentLoaded', () => {
     wireReader();
   } catch (err) {
     recover('DOMContentLoaded sync')({ error: err });
+  }
+
+  // Register the Service Worker. Required for Chrome to consider the app
+  // installable (adds the "Install app" button to the URL bar / menu).
+  // The SW itself is a no-op pass-through; see sw.js for rationale.
+  // Failures here are non-fatal — the app still works in the tab, it
+  // just can't be installed as a PWA on that browser.
+  if ('serviceWorker' in navigator) {
+    // Wait until after 'load' so SW registration doesn't compete with
+    // the app's initial resource fetches on slow connections.
+    window.addEventListener('load', () => {
+      navigator.serviceWorker
+        .register('./sw.js', { scope: './' })
+        .then(reg => console.log('[pwa] Service Worker registered:', reg.scope))
+        .catch(err => console.warn('[pwa] Service Worker registration failed:', err));
+    });
   }
 });
 </script>
