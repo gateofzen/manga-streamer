@@ -681,6 +681,7 @@
     <pre id="debug-output">読み込み中...</pre>
     <div class="debug-modal-actions">
       <button id="debug-copy-btn">クリップボードにコピー</button>
+      <button id="debug-reload-btn">アプリを更新</button>
       <button id="debug-close-btn">閉じる</button>
     </div>
   </div>
@@ -6106,12 +6107,45 @@ async function copyDebugInfo() {
   }
 }
 
+// "Force reload" for installed PWAs where the user can't manually add
+// ?nocache=X to the URL. This wipes every caching layer we can reach
+// and reloads with a cache-bust query so the browser HAS to re-fetch
+// index.html from the server. Called from the debug modal.
+async function forceReload() {
+  toast('キャッシュをクリアしてリロードします...', 2000);
+  try {
+    // 1) Clear the Cache Storage API (any Caches the SW may have opened —
+    //    we don't use any, but old versions of the SW might have).
+    if ('caches' in window) {
+      const keys = await caches.keys();
+      await Promise.all(keys.map(k => caches.delete(k)));
+    }
+    // 2) Unregister every Service Worker. On the next page load a fresh
+    //    SW registration will happen. This forces the browser to bypass
+    //    any SW-mediated response for the reload itself.
+    if ('serviceWorker' in navigator) {
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map(r => r.unregister()));
+    }
+  } catch (e) {
+    console.warn('[force-reload] cleanup failed:', e);
+  }
+  // 3) Reload with a unique cache-bust query. Strip any existing nocache
+  //    param so it doesn't accumulate. Preserve the hash (may hold
+  //    credentials for first-time setup).
+  const url = new URL(location.href);
+  url.searchParams.delete('nocache');
+  url.searchParams.set('nocache', Date.now().toString());
+  location.replace(url.toString());
+}
+
 function wireBrowser() {
   $('back-btn').addEventListener('click', navBack);
   $('signout-btn').addEventListener('click', signOut);
   $('debug-btn').addEventListener('click', openDebugModal);
   $('debug-close-btn').addEventListener('click', closeDebugModal);
   $('debug-copy-btn').addEventListener('click', copyDebugInfo);
+  $('debug-reload-btn').addEventListener('click', forceReload);
   // Also close the modal when tapping the dark overlay outside the content box.
   $('debug-modal').addEventListener('click', (e) => {
     if (e.target.id === 'debug-modal') closeDebugModal();
