@@ -6136,22 +6136,116 @@ async function autoSignIn() {
 async function openDebugModal() {
   const modal = $('debug-modal');
   const output = $('debug-output');
-  output.textContent = '読み込み中...';
   modal.classList.remove('hidden');
-  try {
-    const info = await mangaStreamerDebug();
-    // Also include the raw progress mirror for completeness — but only
-    // metadata (count, IDs), not the actual page positions of every book
-    // to keep the payload small.
-    info._environment = {
+
+  // Build the LOCAL-STATE info synchronously so the modal is useful
+  // immediately, even if the cloud-fetch step hangs. Critical while a
+  // reader is open — the drive-fetch gate is saturated with page
+  // downloads, and any additional Drive call queues behind them.
+  const active = state.progress ? state.progress.activeSession : null;
+  const partial = {
+    hasClientId: !!localStorage.getItem(STORAGE_CLIENT_ID),
+    clientIdSuffix: (() => {
+      const cid = localStorage.getItem(STORAGE_CLIENT_ID) || '';
+      return cid ? '...' + cid.slice(-24) : null;
+    })(),
+    hasClientSecret: !!localStorage.getItem(STORAGE_CLIENT_SECRET),
+    usingWorker: !!WORKER_URL,
+    workerUrl: WORKER_URL || null,
+    hasStoredAccessToken: !!localStorage.getItem(STORAGE_TOKEN),
+    hasStoredRefreshToken: !!localStorage.getItem(STORAGE_REFRESH_TOKEN),
+    accessTokenExpiresIn: state.tokenExpiresAt
+      ? Math.round((state.tokenExpiresAt - Date.now()) / 1000) + 's'
+      : 'no token in memory',
+    progressFileId: state.progressFileId || '(not initialized)',
+    bookCountLocal: Object.keys(state.progress.files || {}).length,
+    deviceId: getDeviceId(),
+    activeSession: active ? {
+      fileName: active.fileName,
+      page: active.page,
+      deviceId: active.deviceId,
+      isOwnDevice: active.deviceId === getDeviceId(),
+      ageMinutes: Math.round((Date.now() - (active.updated || 0)) / 60000),
+    } : '(none)',
+    readerOpen: !!state.reader,
+    readerFile: state.reader && state.reader.file
+      ? { name: state.reader.file.name, id: state.reader.file.id }
+      : null,
+    _environment: {
       userAgent: navigator.userAgent,
       url: location.origin + location.pathname,
       timestamp: new Date().toISOString(),
-    };
-    output.textContent = JSON.stringify(info, null, 2);
-  } catch (e) {
-    output.textContent = 'Error: ' + e.message;
+    },
+  };
+  output.textContent = JSON.stringify(partial, null, 2)
+    + '\n\n... cloud を問い合わせ中 (最大 5 秒)';
+
+  // Now do the async parts (tokeninfo + cloud activeSession) with a
+  // strict timeout so a slow/blocked Drive gate doesn't leave the modal
+  // stuck on "loading" forever.
+  const withTimeout = (p, ms) => Promise.race([
+    p,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('timeout ' + ms + 'ms')), ms)),
+  ]);
+
+  // Google tokeninfo (independent of Drive gate — direct fetch)
+  if (state.accessToken) {
+    try {
+      const resp = await withTimeout(fetch(
+        'https://www.googleapis.com/oauth2/v3/tokeninfo?access_token=' + state.accessToken
+      ), 5000);
+      if (resp.ok) {
+        const t = await resp.json();
+        partial.googleEmail = t.email;
+        partial.grantedScopes = t.scope;
+        partial.hasDriveReadonlyScope = t.scope && t.scope.includes('drive.readonly');
+        partial.hasDriveAppdataScope = t.scope && t.scope.includes('drive.appdata');
+      } else {
+        partial.tokenInfoError = 'HTTP ' + resp.status;
+      }
+    } catch (e) {
+      partial.tokenInfoError = e.message;
+    }
   }
+
+  // Cloud activeSession fetch — goes through drive gate at TOP priority
+  // to jump the queue past image downloads. Also 5-second timeout.
+  if (state.progressFileId && state.accessToken) {
+    try {
+      const cloudData = await withTimeout(
+        _readProgressFileForDebug(state.progressFileId),
+        5000
+      );
+      const cActive = cloudData && cloudData.activeSession;
+      if (cActive) {
+        partial.cloudActiveSession = {
+          fileName: cActive.fileName,
+          page: cActive.page,
+          deviceId: cActive.deviceId,
+          isOwnDevice: cActive.deviceId === getDeviceId(),
+          ageMinutes: Math.round((Date.now() - (cActive.updated || 0)) / 60000),
+        };
+      } else {
+        partial.cloudActiveSession = '(none in cloud)';
+      }
+    } catch (e) {
+      partial.cloudActiveSessionError = e.message;
+    }
+  }
+
+  output.textContent = JSON.stringify(partial, null, 2);
+}
+
+// Priority-0 (highest) fetch of the progress file for the diagnostic modal.
+// Uses the same Drive endpoint as readProgressFile but jumps the gate past
+// image-page downloads so the modal doesn't hang while a reader is open.
+async function _readProgressFileForDebug(fileId) {
+  const resp = await driveFetch(
+    `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
+    { priority: 0 }
+  );
+  if (!resp.ok) throw new Error('AppData read failed: ' + resp.status);
+  return await readBodyJson(resp);
 }
 
 function closeDebugModal() {
