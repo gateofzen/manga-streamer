@@ -2505,11 +2505,12 @@ function setProgress(fileId, page, meta) {
 
 function scheduleProgressSave() {
   if (saveTimer) clearTimeout(saveTimer);
-  // Shortened from 3000ms. On mobile, the gap between the last page turn
-  // and the screen turning off can be very short, so we want progress
-  // committed to Drive quickly. 1.2s still coalesces rapid page-flips
-  // into a single network write.
-  saveTimer = setTimeout(flushProgressSave, 1200);
+  // 500ms debounce: fast enough that another device watching the same book
+  // sees the new page within ~5-6 seconds worst case (this write + their
+  // periodic poll interval). Still coalesces rapid page-flipping so a burst
+  // of turns doesn't fire one PATCH per page — after the user settles for
+  // 500ms, a single write persists the final page.
+  saveTimer = setTimeout(flushProgressSave, 500);
 }
 
 async function flushProgressSave() {
@@ -2810,48 +2811,63 @@ window.addEventListener('beforeunload', () => {
 });
 
 // ------------------------------------------------------------------
-// Reliable cross-device sync on Android wake-up
+// Reliable cross-device sync on Android wake-up + fast in-reader sync
 // ------------------------------------------------------------------
 // On Android Chrome/PWA, the browser often does NOT fire visibilitychange
 // when the physical screen turns off/on (the tab remains "visible" to the
 // browser's process). This means our normal foreground-sync path can miss
 // the moment the user wakes the device after another device made progress.
 //
-// Two fallbacks catch this case:
+// Also, when TWO devices are both actively reading the same book, users
+// expect the "follower" device to catch up within a few seconds — not
+// after a 30 s poll. So the polling cadence is adaptive:
 //
-//   1) Periodic sync: while a reader is open OR the browser view is up,
-//      poll cloud every 30 s. Cheap (single small JSON fetch) and ensures
-//      that even if no user event fires, we still see other-device updates
-//      within half a minute.
+//   READER OPEN     → poll every 5 s (close-to-real-time follow)
+//   BROWSER OPEN    → poll every 30 s (progress tags stay reasonably fresh)
+//   NEITHER / HIDDEN → don't poll (nothing to update)
 //
-//   2) Pointerdown trigger: when the user physically taps the screen after
-//      an idle period, do a sync. This is what actually catches the
-//      "screen just came back on" case — the user always taps SOMETHING
-//      when they resume.
+// Fallbacks that also funnel into syncOnForeground:
+//   * visibilitychange (fires reliably on most, but not all Android setups)
+//   * focus, pageshow  (desktop / bfcache)
+//   * pointerdown      (any tap after 3s idle — catches Android wake)
 //
-// Both funnel into syncOnForeground(), which already has its own 1-second
-// debounce so back-to-back triggers don't over-fetch.
+// All triggers share the 1-second internal debounce in syncOnForeground,
+// so no matter how many fire, we cap at one refresh per second.
 
-setInterval(() => {
-  // Only run when we've been authenticated at least once and there's a
-  // reader or browser visible (i.e. the user is inside the app, not on
-  // the sign-in screen).
+const _syncTick = () => {
   if (!state.accessToken || !state.progressFileId) return;
   if (document.hidden) return;
   const readerVisible = state.reader && !$('reader-screen').classList.contains('hidden');
   const browserVisible = !$('browser-screen').classList.contains('hidden');
   if (!readerVisible && !browserVisible) return;
-  syncOnForeground('periodic-30s');
-}, 30 * 1000);
+  syncOnForeground(readerVisible ? 'periodic-reader-5s' : 'periodic-browser-30s');
+};
+// Fast tick every 5 s. When the browser view is up (not the reader), we
+// only actually sync every 6th tick — see the tick counter below.
+let _syncTickCount = 0;
+setInterval(() => {
+  _syncTickCount++;
+  if (!state.accessToken || !state.progressFileId) return;
+  if (document.hidden) return;
+  const readerVisible = state.reader && !$('reader-screen').classList.contains('hidden');
+  const browserVisible = !$('browser-screen').classList.contains('hidden');
+  if (readerVisible) {
+    // 5s cadence in reader
+    _syncTick();
+  } else if (browserVisible && _syncTickCount % 6 === 0) {
+    // 30s cadence in browser (every 6th 5-second tick)
+    _syncTick();
+  }
+}, 5 * 1000);
 
 // Pointerdown-based sync: user tapped, and it's been a while since last
 // sync — check for updates. Uses `passive: true` so we don't interfere
 // with touch handling in the reader.
 document.addEventListener('pointerdown', () => {
   if (!state.accessToken || !state.progressFileId) return;
-  // Only sync on tap if it's been at least 15 s since the last sync,
-  // to avoid hammering Drive on every touch during normal reading.
-  if (Date.now() - _lastForegroundSync < 15 * 1000) return;
+  // 3s throttle so rapid taps don't hammer Drive but individual "wake up
+  // and start reading" taps do get their own sync.
+  if (Date.now() - _lastForegroundSync < 3 * 1000) return;
   syncOnForeground('pointerdown');
 }, { passive: true });
 
