@@ -2698,21 +2698,22 @@ function syncOnForeground(trigger) {
         }
       }
 
-      // CASE 1b: same book, check for newer page. We prefer activeSession's
-      // page as the authoritative "what page is a live device on right now"
-      // signal, falling back to files[X].page only if activeSession isn't
-      // helpful. Rationale: after we jump via CASE 1b, jumpToPage triggers
-      // setProgress which timestamps files[X] with our local wall-clock.
-      // Two devices with slightly different clocks (~1-2 s skew is normal)
-      // will then race, and the "faster clock" device's local write can
-      // beat the other's cloud write during merge — causing the follower
-      // to stop following. activeSession is written by whoever is actively
-      // reading and carries that device's ID, so it's a cleaner "who owns
-      // the current page" signal.
+      // CASE 1b: same book, check for newer page. Two important rules:
+      //
+      // 1) Prefer activeSession's page when it comes from another device.
+      //    activeSession is "who's live on which page right now" — cleaner
+      //    signal than files[X] which can suffer wall-clock timestamp races
+      //    (two devices with slightly different clocks can each write
+      //    plausible "newer" timestamps, causing ping-pong merges).
+      //
+      // 2) FORWARD ONLY. Never jump BACKWARDS to a page below the one
+      //    we're currently reading. Without this, the follower device that
+      //    is delayed can drag the leader back — user turns a page on A,
+      //    B slowly catches up, cloud briefly holds B's older page as the
+      //    "most recent write", A syncs and gets pulled backward. Very
+      //    disorienting when reading. If the user genuinely wants to
+      //    re-read a passage they should navigate manually on each device.
       if (state.reader.file.id !== targetId) return;
-      // Re-read activeSession (may have been updated by refreshProgress);
-      // note the CASE 1a check above uses the same variable name but that
-      // block returned early if it matched, so we're safe to reuse.
       const activeForPage = state.progress.activeSession;
       const activeFromOtherDevice = activeForPage
         && activeForPage.fileId === targetId
@@ -2724,26 +2725,36 @@ function syncOnForeground(trigger) {
       // Prefer activeSession's page when it comes from another device.
       let targetPage = null;
       let targetUpdated = 0;
+      let source = null;
       if (activeFromOtherDevice && activeForPage.page != null) {
         targetPage = activeForPage.page;
         targetUpdated = activeForPage.updated || 0;
+        source = 'activeSession';
       } else if (filePage != null) {
         targetPage = filePage;
         targetUpdated = (after && after.updated) || 0;
+        source = 'files';
       }
       if (targetPage == null) return;
 
       const slot = state.reader.slots[state.reader.currentSlotIndex];
       const curPage = slot ? state.reader._realPage(slot[0]) : null;
+      if (curPage == null) return;
       if (curPage === targetPage) return;
 
-      // Only jump if the cloud data is at least as new as what we had
-      // before this refresh (protects against jumping BACKWARDS to a
-      // stale value that somehow slipped in).
+      // FORWARD ONLY — never sync backwards. If the cloud says a lower
+      // page than what we're reading, we're the leader; ignore.
+      if (targetPage < curPage) {
+        console.log('[sync-fg] Ignoring backward sync: target page',
+          targetPage + 1, '<', 'current page', curPage + 1,
+          '(source:', source + ')');
+        return;
+      }
+
       if (targetUpdated >= beforeUpdated) {
-        console.log('[sync-fg] Jumping to newer page from cloud: page',
-          targetPage + 1, '(was on page', (curPage != null ? curPage + 1 : '?'),
-          ', source:', activeFromOtherDevice ? 'activeSession' : 'files', ')');
+        console.log('[sync-fg] Jumping FORWARD from cloud: page',
+          targetPage + 1, '(was page', curPage + 1,
+          ', source:', source + ')');
         state.reader.jumpToPage(targetPage + 1);
         toast(`他のデバイスの続きに同期 (${targetPage + 1}ページ)`, 2000);
       }
