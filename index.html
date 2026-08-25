@@ -2664,46 +2664,83 @@ function syncOnForeground(trigger) {
     return;
   }
   _lastForegroundSync = now;
+  console.log('[sync-fg] triggered by:', trigger);
 
-  // CASE 1: a reader is open. The user may have read further on another
-  // device while this one was backgrounded (e.g. PC tab left open on a
-  // page, then phone reads ahead). Pull the latest progress and re-seek
-  // the open book if the cloud has a newer page for it.
+  // CASE 1: a reader is open. Two sub-cases handled after refreshProgress:
+  //  1a) Another device is actively reading a DIFFERENT book — follow it.
+  //  1b) Same book, newer page on another device — jump to that page.
   if (state.reader && !$('reader-screen').classList.contains('hidden')) {
     const targetId = state.reader.file.id;
     const before = state.progress.files[targetId];
     const beforePage = before ? before.page : null;
     const beforeUpdated = before ? (before.updated || 0) : 0;
     refreshProgress().then(() => {
-      if (!state.reader || state.reader.file.id !== targetId) {
-        return;
+      if (!state.reader) return;
+
+      // CASE 1a: activeSession points to a DIFFERENT book than the one
+      // we're showing, and it's fresh + from another device. Switch to it.
+      const active = state.progress.activeSession;
+      if (active && active.fileId && active.fileId !== state.reader.file.id) {
+        const activeAge = Date.now() - (active.updated || 0);
+        const isFromOtherDevice = active.deviceId && active.deviceId !== getDeviceId();
+        if (activeAge < ACTIVE_SESSION_MAX_AGE_MS && isFromOtherDevice) {
+          console.log('[sync-fg] Switching to different book from another device:',
+            active.fileName, 'page', active.page);
+          toast(`他のデバイスで別の本を開いています…`, 3000);
+          const file = {
+            id: active.fileId,
+            name: active.fileName || 'Manga',
+            size: active.fileSize || 0,
+            mimeType: 'application/zip',
+          };
+          openZip(file, null, { autoFullscreen: false });
+          return;
+        }
       }
+
+      // CASE 1b: same book, check for newer page.
+      if (state.reader.file.id !== targetId) return;
       const after = state.progress.files[targetId];
-      if (!after || after.page == null) {
-        return;
-      }
-      // Where is the reader actually sitting right now?
+      if (!after || after.page == null) return;
       const slot = state.reader.slots[state.reader.currentSlotIndex];
       const curPage = slot ? state.reader._realPage(slot[0]) : null;
-      if (curPage === after.page) {
-        return;
-      }
-      // Jump if the cloud record is newer than what we had before the
-      // refresh, OR (defensively) if the cloud simply points somewhere
-      // different and is at least as new — covers clock-skew edge cases.
+      if (curPage === after.page) return;
       if ((after.updated || 0) >= beforeUpdated && after.page !== curPage) {
+        console.log('[sync-fg] Jumping to newer page from cloud:', after.page + 1,
+          '(was on page', (curPage != null ? curPage + 1 : '?'), ')');
         state.reader.jumpToPage(after.page + 1);
         toast(`他のデバイスの続きに同期 (${after.page + 1}ページ)`, 2000);
-      } else {
       }
-    }).catch(e => console.warn('[sync] refresh failed:', e));
+    }).catch(e => console.warn('[sync-fg] refresh failed:', e));
     return;
   }
 
   // CASE 2: the file browser is showing — refresh and re-render the list
-  // so progress tags reflect reading done elsewhere.
+  // so progress tags reflect reading done elsewhere. Also check for
+  // activeSession from another device (auto-open the book they're reading).
   if (!$('browser-screen').classList.contains('hidden')) {
     refreshProgress().then(() => {
+      // Same "another device is reading" check as CASE 1a, but from the
+      // browser view — if another device is active, auto-open that book
+      // even though we don't have a reader yet.
+      const active = state.progress.activeSession;
+      if (active && active.fileId) {
+        const activeAge = Date.now() - (active.updated || 0);
+        const isFromOtherDevice = active.deviceId && active.deviceId !== getDeviceId();
+        if (activeAge < ACTIVE_SESSION_MAX_AGE_MS && isFromOtherDevice && !state.reader) {
+          console.log('[sync-fg] Browser view — opening active book from another device:',
+            active.fileName);
+          toast(`他のデバイスで読んでいる本を開いています…`, 3000);
+          const file = {
+            id: active.fileId,
+            name: active.fileName || 'Manga',
+            size: active.fileSize || 0,
+            mimeType: 'application/zip',
+          };
+          openZip(file, null, { autoFullscreen: false });
+          return;
+        }
+      }
       if (state.history) renderHistory();
       else if (state.searching) renderFileList(state.searchResults);
       else renderFileList(state.currentFiles);
@@ -2771,6 +2808,52 @@ document.addEventListener('freeze', () => {
 window.addEventListener('beforeunload', () => {
   flushProgressKeepalive();
 });
+
+// ------------------------------------------------------------------
+// Reliable cross-device sync on Android wake-up
+// ------------------------------------------------------------------
+// On Android Chrome/PWA, the browser often does NOT fire visibilitychange
+// when the physical screen turns off/on (the tab remains "visible" to the
+// browser's process). This means our normal foreground-sync path can miss
+// the moment the user wakes the device after another device made progress.
+//
+// Two fallbacks catch this case:
+//
+//   1) Periodic sync: while a reader is open OR the browser view is up,
+//      poll cloud every 30 s. Cheap (single small JSON fetch) and ensures
+//      that even if no user event fires, we still see other-device updates
+//      within half a minute.
+//
+//   2) Pointerdown trigger: when the user physically taps the screen after
+//      an idle period, do a sync. This is what actually catches the
+//      "screen just came back on" case — the user always taps SOMETHING
+//      when they resume.
+//
+// Both funnel into syncOnForeground(), which already has its own 1-second
+// debounce so back-to-back triggers don't over-fetch.
+
+setInterval(() => {
+  // Only run when we've been authenticated at least once and there's a
+  // reader or browser visible (i.e. the user is inside the app, not on
+  // the sign-in screen).
+  if (!state.accessToken || !state.progressFileId) return;
+  if (document.hidden) return;
+  const readerVisible = state.reader && !$('reader-screen').classList.contains('hidden');
+  const browserVisible = !$('browser-screen').classList.contains('hidden');
+  if (!readerVisible && !browserVisible) return;
+  syncOnForeground('periodic-30s');
+}, 30 * 1000);
+
+// Pointerdown-based sync: user tapped, and it's been a while since last
+// sync — check for updates. Uses `passive: true` so we don't interfere
+// with touch handling in the reader.
+document.addEventListener('pointerdown', () => {
+  if (!state.accessToken || !state.progressFileId) return;
+  // Only sync on tap if it's been at least 15 s since the last sync,
+  // to avoid hammering Drive on every touch during normal reading.
+  if (Date.now() - _lastForegroundSync < 15 * 1000) return;
+  syncOnForeground('pointerdown');
+}, { passive: true });
 
 //===========================================================================
 // ZIP streaming reader
