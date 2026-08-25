@@ -1633,6 +1633,7 @@ function setDriveCritical(on) { /* no-op */ }
 // underlying cause is usually: different Google accounts signed in,
 // different OAuth client IDs, or a missing scope grant.
 window.mangaStreamerDebug = async function() {
+  const active = state.progress ? state.progress.activeSession : null;
   const info = {
     // Auth material in localStorage
     hasClientId: !!localStorage.getItem(STORAGE_CLIENT_ID),
@@ -1651,6 +1652,15 @@ window.mangaStreamerDebug = async function() {
     // Sync state
     progressFileId: state.progressFileId || '(not initialized)',
     bookCountLocal: Object.keys(state.progress.files || {}).length,
+    // Active session (cross-device "currently reading" record)
+    deviceId: getDeviceId(),
+    activeSession: active ? {
+      fileName: active.fileName,
+      page: active.page,
+      deviceId: active.deviceId,
+      isOwnDevice: active.deviceId === getDeviceId(),
+      ageMinutes: Math.round((Date.now() - (active.updated || 0)) / 60000),
+    } : '(none)',
   };
 
   // Ask Google what account this token belongs to and what scopes it has.
@@ -2364,7 +2374,7 @@ function getDeviceId() {
 // Cleared by:
 //   - Reader closed by user action (back/close button, sign out)
 //   - Automatic expiry (checked on resume): older than 4h = ignore
-const ACTIVE_SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const ACTIVE_SESSION_MAX_AGE_MS = 4 * 60 * 60 * 1000;
 
 function setActiveSession(file, page) {
   if (!file || !file.id) return;
@@ -2377,6 +2387,7 @@ function setActiveSession(file, page) {
     updated: Date.now(),
   };
   saveLocalMirror();
+  console.log('[active-session] SET:', file.name, 'page', page);
 }
 
 function touchActiveSession() {
@@ -2387,12 +2398,15 @@ function touchActiveSession() {
   s.updated = Date.now();
   s.deviceId = getDeviceId();
   saveLocalMirror();
+  console.log('[active-session] TOUCH:', s.fileName, 'page', s.page);
 }
 
 function clearActiveSession() {
   if (state.progress.activeSession) {
+    const s = state.progress.activeSession;
     delete state.progress.activeSession;
     saveLocalMirror();
+    console.log('[active-session] CLEAR (was:', s.fileName, 'page', s.page, ')');
   }
 }
 
