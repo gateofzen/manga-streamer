@@ -2505,12 +2505,11 @@ function setProgress(fileId, page, meta) {
 
 function scheduleProgressSave() {
   if (saveTimer) clearTimeout(saveTimer);
-  // 500ms debounce: fast enough that another device watching the same book
-  // sees the new page within ~5-6 seconds worst case (this write + their
-  // periodic poll interval). Still coalesces rapid page-flipping so a burst
-  // of turns doesn't fire one PATCH per page — after the user settles for
-  // 500ms, a single write persists the final page.
-  saveTimer = setTimeout(flushProgressSave, 500);
+  // 300ms debounce: tight enough that a page turn on one device reaches
+  // cloud within ~0.3-0.5s, coalescing only very rapid flips into a
+  // single write. Combined with the follower's 3-second poll interval,
+  // worst-case cross-device lag is ~3.5s and typical ~2s.
+  saveTimer = setTimeout(flushProgressSave, 300);
 }
 
 async function flushProgressSave() {
@@ -2699,18 +2698,54 @@ function syncOnForeground(trigger) {
         }
       }
 
-      // CASE 1b: same book, check for newer page.
+      // CASE 1b: same book, check for newer page. We prefer activeSession's
+      // page as the authoritative "what page is a live device on right now"
+      // signal, falling back to files[X].page only if activeSession isn't
+      // helpful. Rationale: after we jump via CASE 1b, jumpToPage triggers
+      // setProgress which timestamps files[X] with our local wall-clock.
+      // Two devices with slightly different clocks (~1-2 s skew is normal)
+      // will then race, and the "faster clock" device's local write can
+      // beat the other's cloud write during merge — causing the follower
+      // to stop following. activeSession is written by whoever is actively
+      // reading and carries that device's ID, so it's a cleaner "who owns
+      // the current page" signal.
       if (state.reader.file.id !== targetId) return;
+      // Re-read activeSession (may have been updated by refreshProgress);
+      // note the CASE 1a check above uses the same variable name but that
+      // block returned early if it matched, so we're safe to reuse.
+      const activeForPage = state.progress.activeSession;
+      const activeFromOtherDevice = activeForPage
+        && activeForPage.fileId === targetId
+        && activeForPage.deviceId
+        && activeForPage.deviceId !== getDeviceId();
       const after = state.progress.files[targetId];
-      if (!after || after.page == null) return;
+      const filePage = after && after.page != null ? after.page : null;
+
+      // Prefer activeSession's page when it comes from another device.
+      let targetPage = null;
+      let targetUpdated = 0;
+      if (activeFromOtherDevice && activeForPage.page != null) {
+        targetPage = activeForPage.page;
+        targetUpdated = activeForPage.updated || 0;
+      } else if (filePage != null) {
+        targetPage = filePage;
+        targetUpdated = (after && after.updated) || 0;
+      }
+      if (targetPage == null) return;
+
       const slot = state.reader.slots[state.reader.currentSlotIndex];
       const curPage = slot ? state.reader._realPage(slot[0]) : null;
-      if (curPage === after.page) return;
-      if ((after.updated || 0) >= beforeUpdated && after.page !== curPage) {
-        console.log('[sync-fg] Jumping to newer page from cloud:', after.page + 1,
-          '(was on page', (curPage != null ? curPage + 1 : '?'), ')');
-        state.reader.jumpToPage(after.page + 1);
-        toast(`他のデバイスの続きに同期 (${after.page + 1}ページ)`, 2000);
+      if (curPage === targetPage) return;
+
+      // Only jump if the cloud data is at least as new as what we had
+      // before this refresh (protects against jumping BACKWARDS to a
+      // stale value that somehow slipped in).
+      if (targetUpdated >= beforeUpdated) {
+        console.log('[sync-fg] Jumping to newer page from cloud: page',
+          targetPage + 1, '(was on page', (curPage != null ? curPage + 1 : '?'),
+          ', source:', activeFromOtherDevice ? 'activeSession' : 'files', ')');
+        state.reader.jumpToPage(targetPage + 1);
+        toast(`他のデバイスの続きに同期 (${targetPage + 1}ページ)`, 2000);
       }
     }).catch(e => console.warn('[sync-fg] refresh failed:', e));
     return;
@@ -2840,10 +2875,10 @@ const _syncTick = () => {
   const readerVisible = state.reader && !$('reader-screen').classList.contains('hidden');
   const browserVisible = !$('browser-screen').classList.contains('hidden');
   if (!readerVisible && !browserVisible) return;
-  syncOnForeground(readerVisible ? 'periodic-reader-5s' : 'periodic-browser-30s');
+  syncOnForeground(readerVisible ? 'periodic-reader-3s' : 'periodic-browser-30s');
 };
-// Fast tick every 5 s. When the browser view is up (not the reader), we
-// only actually sync every 6th tick — see the tick counter below.
+// Fast tick every 3 s. When the browser view is up (not the reader), we
+// only actually sync every 10th tick (30 s cadence).
 let _syncTickCount = 0;
 setInterval(() => {
   _syncTickCount++;
@@ -2852,13 +2887,13 @@ setInterval(() => {
   const readerVisible = state.reader && !$('reader-screen').classList.contains('hidden');
   const browserVisible = !$('browser-screen').classList.contains('hidden');
   if (readerVisible) {
-    // 5s cadence in reader
+    // 3s cadence in reader for close-to-real-time following
     _syncTick();
-  } else if (browserVisible && _syncTickCount % 6 === 0) {
-    // 30s cadence in browser (every 6th 5-second tick)
+  } else if (browserVisible && _syncTickCount % 10 === 0) {
+    // 30s cadence in browser (every 10th 3-second tick)
     _syncTick();
   }
-}, 5 * 1000);
+}, 3 * 1000);
 
 // Pointerdown-based sync: user tapped, and it's been a while since last
 // sync — check for updates. Uses `passive: true` so we don't interfere
