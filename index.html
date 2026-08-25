@@ -734,6 +734,7 @@ const STORAGE_REFRESH_TOKEN = 'mangaStreamer.refreshToken';
 const STORAGE_SIGNED_OUT = 'mangaStreamer.signedOut';  // "1" if user explicitly signed out
 const STORAGE_PKCE_VERIFIER = 'mangaStreamer.pkceVerifier';  // sessionStorage
 const STORAGE_PROGRESS_MIRROR = 'mangaStreamer.progressMirror';
+const STORAGE_DEVICE_ID = 'mangaStreamer.deviceId';  // Stable per-browser UUID
 const STORAGE_LEGACY_PROGRESS = 'mangaStreamer.progress';
 const STORAGE_VIEW_MODE = 'mangaStreamer.viewMode';
 const STORAGE_SPLIT_MODE = 'mangaStreamer.splitMode';
@@ -1742,6 +1743,57 @@ async function onSignedIn() {
   state.folderStack = [{ id: 'root', name: 'My Drive' }];
   await initProgressSync();
   loadCurrentFolder();
+  // If another device was actively reading a book within the last few
+  // hours, open it automatically so the user can pick up seamlessly.
+  // This runs AFTER loadCurrentFolder so the browser screen is populated
+  // in the background — when the user closes the auto-opened reader, they
+  // land on the file list instead of an empty screen.
+  maybeResumeActiveSession();
+}
+
+// Auto-open the manga another device was reading, when appropriate.
+// Conditions:
+//   - We have an activeSession record in the progress data
+//   - It's newer than ACTIVE_SESSION_MAX_AGE_MS (default 4 hours)
+//   - It was written by a DIFFERENT device (don't re-open our own last book
+//     — the user might have intentionally closed the app to browse)
+//   - We're currently on the browser screen (not already in a reader)
+async function maybeResumeActiveSession() {
+  const s = state.progress.activeSession;
+  if (!s || !s.fileId) {
+    console.log('[resume] no active session');
+    return;
+  }
+  const ageMs = Date.now() - (s.updated || 0);
+  if (ageMs > ACTIVE_SESSION_MAX_AGE_MS) {
+    console.log('[resume] active session too old (' + Math.round(ageMs / 60000) + ' min), ignoring');
+    // Clear the stale record to prevent revisiting this check every launch.
+    clearActiveSession();
+    scheduleProgressSave();
+    return;
+  }
+  if (s.deviceId === getDeviceId()) {
+    console.log('[resume] active session is our own device, not re-opening');
+    return;
+  }
+  if (state.reader) {
+    console.log('[resume] reader already open, not overriding');
+    return;
+  }
+  console.log('[resume] Opening active session from another device:',
+    s.fileName || s.fileId, 'at page', s.page,
+    '(', Math.round(ageMs / 60000), 'min ago )');
+  toast(`他のデバイスで読んでいた続きを開いています...`, 3000);
+  // Build a minimal file object — enough for openZip / Reader to work.
+  const file = {
+    id: s.fileId,
+    name: s.fileName || 'Manga',
+    size: s.fileSize || 0,
+    mimeType: 'application/zip',
+  };
+  // Don't force fullscreen on auto-resume — user didn't tap anything,
+  // and browser fullscreen APIs require a user gesture anyway.
+  openZip(file, null, { autoFullscreen: false });
 }
 
 function signOut() {
@@ -1921,7 +1973,19 @@ async function readBodyBlob(resp) {
   }
 }
 
+// Session-level cache for folder contents. Keyed by folder id (with a
+// separate '__shared__' key for the shared-folders list). TTL is short —
+// long enough to make back-forward navigation feel instant, short enough
+// that changes in Drive (new uploads, renames) are picked up within a
+// minute of navigating back to that folder.
+const _folderContentsCache = new Map();  // folderId → { at, files }
+const FOLDER_CONTENTS_TTL_MS = 60 * 1000;
+
 async function listFolder(folderId) {
+  const cached = _folderContentsCache.get(folderId);
+  if (cached && Date.now() - cached.at < FOLDER_CONTENTS_TTL_MS) {
+    return cached.files;
+  }
   const q = `'${folderId}' in parents and trashed = false`;
   const params = new URLSearchParams({
     q,
@@ -1935,10 +1999,17 @@ async function listFolder(folderId) {
   const resp = await driveFetch('https://www.googleapis.com/drive/v3/files?' + params);
   if (!resp.ok) throw new Error('Drive list failed: ' + resp.status);
   const data = await readBodyJson(resp);
-  return data.files || [];
+  const files = data.files || [];
+  _folderContentsCache.set(folderId, { at: Date.now(), files });
+  return files;
 }
 
 async function listSharedFolders() {
+  const cacheKey = '__shared__';
+  const cached = _folderContentsCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < FOLDER_CONTENTS_TTL_MS) {
+    return cached.files;
+  }
   // Folders shared with the user (Shared with me). These don't appear under
   // 'root' parents — they live in a separate Drive space and need their own
   // query. We pin them to the top of the My Drive root view.
@@ -1958,7 +2029,9 @@ async function listSharedFolders() {
     return [];
   }
   const data = await readBodyJson(resp);
-  return data.files || [];
+  const files = data.files || [];
+  _folderContentsCache.set(cacheKey, { at: Date.now(), files });
+  return files;
 }
 
 async function searchDrive(query) {
@@ -2123,29 +2196,64 @@ let savePromise = null;
 async function initProgressSync() {
   console.log('[sync] Initializing progress sync');
   showSync(true);
+  // Snapshot the local (preloaded) state BEFORE we fetch cloud, so we can
+  // properly merge without losing books that only exist locally.
+  const localSnapshot = state.progress || { version: 1, files: {} };
+  const localFilesCount = Object.keys(localSnapshot.files || {}).length;
+
   try {
     state.progressFileId = await findProgressFile();
     console.log('[sync] Progress file ID:', state.progressFileId || '(will create new)');
 
+    let cloudData = null;
     if (state.progressFileId) {
       try {
-        const data = await readProgressFile(state.progressFileId);
-        state.progress = (data && data.files) ? data : { version: 1, files: {} };
-        console.log('[sync] Loaded from cloud:',
-          Object.keys(state.progress.files).length, 'books tracked');
+        cloudData = await readProgressFile(state.progressFileId);
+        const cloudCount = cloudData && cloudData.files
+          ? Object.keys(cloudData.files).length : 0;
+        console.log('[sync] Loaded from cloud:', cloudCount, 'books tracked; local had', localFilesCount);
       } catch (e) {
-        console.warn('[sync] Could not read progress file, starting fresh:', e);
-        state.progress = { version: 1, files: {} };
+        console.warn('[sync] Could not read progress file, keeping local:', e);
       }
-    } else {
-      state.progress = { version: 1, files: {} };
     }
 
-    // Migrate any localStorage progress (legacy + mirror) into cloud
-    const merged = mergeLocalIntoCloud();
-    if (merged) {
-      console.log('[sync] Merged local mirror into cloud state');
+    // Merge cloud data into the local snapshot. Local entries survive (they
+    // may be newer than cloud, e.g. reading offline then coming back online),
+    // and cloud entries fill in anything the local mirror doesn't have.
+    // Per-book: newer `updated` timestamp wins.
+    if (cloudData && cloudData.files) {
+      const mergedFiles = { ...(localSnapshot.files || {}) };
+      let cloudNewer = 0, localNewer = 0;
+      for (const [fid, cloudEntry] of Object.entries(cloudData.files)) {
+        const local = mergedFiles[fid];
+        if (!local || (cloudEntry.updated || 0) > (local.updated || 0)) {
+          mergedFiles[fid] = cloudEntry;
+          if (local) cloudNewer++;
+        } else if ((local.updated || 0) > (cloudEntry.updated || 0)) {
+          localNewer++;
+        }
+      }
+      // activeSession: cloud vs local — newest wins (comparing `updated`).
+      let mergedActive = localSnapshot.activeSession;
+      if (cloudData.activeSession) {
+        const localAt = mergedActive ? (mergedActive.updated || 0) : 0;
+        const cloudAt = cloudData.activeSession.updated || 0;
+        if (cloudAt > localAt) mergedActive = cloudData.activeSession;
+      }
+      state.progress = {
+        version: cloudData.version || 1,
+        files: mergedFiles,
+        ...(mergedActive ? { activeSession: mergedActive } : {}),
+      };
+      console.log('[sync] Merged: cloud contributed newer for', cloudNewer,
+        'books; local had newer for', localNewer);
+    } else {
+      // No cloud file yet — keep local snapshot as-is.
+      state.progress = localSnapshot;
     }
+
+    // Legacy migration (only if legacy keys exist in localStorage).
+    mergeLocalIntoCloud();
 
     if (!state.progressFileId) {
       try {
@@ -2154,11 +2262,20 @@ async function initProgressSync() {
       } catch (e) {
         console.warn('[sync] Could not create cloud progress file:', e);
       }
-    } else if (merged) {
+    } else {
+      // Push our merged view back — cloud may be missing local-only records
+      // AND our merge may have overwritten a stale cloud entry with a newer
+      // local one.
       scheduleProgressSave();
     }
 
     saveLocalMirror();
+
+    // Re-render history/browser if the user is already looking at them.
+    // This is the second half of "instant history" — the first half (preload)
+    // showed local data immediately; this shows the just-merged view.
+    if (state.history) renderHistory();
+    else if (!state.searching && state.currentFiles) renderFileList(state.currentFiles);
   } finally {
     showSync(false);
   }
@@ -2194,6 +2311,88 @@ function saveLocalMirror() {
   try {
     localStorage.setItem(STORAGE_PROGRESS_MIRROR, JSON.stringify(state.progress));
   } catch {}
+}
+
+// Load the localStorage progress mirror into state.progress at startup —
+// BEFORE any Drive round-trip. This makes History render instantly (from
+// the last-saved local snapshot) instead of waiting on initProgressSync's
+// cloud fetch. When the cloud data arrives later, refreshProgress merges
+// it in and the UI updates.
+function preloadLocalMirror() {
+  try {
+    const raw = localStorage.getItem(STORAGE_PROGRESS_MIRROR);
+    if (!raw) return false;
+    const mirror = JSON.parse(raw);
+    if (mirror && typeof mirror === 'object' && mirror.files) {
+      state.progress = mirror;
+      const n = Object.keys(mirror.files).length;
+      console.log('[progress] Preloaded', n, 'books from localStorage mirror');
+      return true;
+    }
+  } catch (e) {
+    console.warn('[progress] Preload failed:', e);
+  }
+  return false;
+}
+
+// Stable per-browser identifier. Used to tag activeSession writes so a
+// device doesn't try to "resume" its own session on the next launch.
+// Generated once, saved forever (unless the user clears localStorage).
+function getDeviceId() {
+  let id = localStorage.getItem(STORAGE_DEVICE_ID);
+  if (!id) {
+    // Prefer crypto.randomUUID; fall back for very old browsers.
+    id = (crypto.randomUUID
+      ? crypto.randomUUID()
+      : 'dev-' + Math.random().toString(36).slice(2) + Date.now().toString(36));
+    try { localStorage.setItem(STORAGE_DEVICE_ID, id); } catch {}
+  }
+  return id;
+}
+
+// Active-session support: records which manga is "currently being read"
+// so another device can pick up right where you left off. This is
+// DIFFERENT from per-book progress (which tells "at what page did I last
+// leave book X"). activeSession tells "which book should I open when the
+// app starts, because someone was actively reading it recently".
+//
+// Set by:
+//   - openZip() when opening a book
+//   - setProgress() when the reader page changes
+//   - visibilitychange→hidden while reader is open (screen off / tab swap)
+// Cleared by:
+//   - Reader closed by user action (back/close button, sign out)
+//   - Automatic expiry (checked on resume): older than 4h = ignore
+const ACTIVE_SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+function setActiveSession(file, page) {
+  if (!file || !file.id) return;
+  state.progress.activeSession = {
+    fileId: file.id,
+    fileName: file.name || '',
+    fileSize: file.size || 0,
+    page: page,
+    deviceId: getDeviceId(),
+    updated: Date.now(),
+  };
+  saveLocalMirror();
+}
+
+function touchActiveSession() {
+  // Update the timestamp on the existing active session — used when the
+  // screen turns off with a book open, to signal "I'm still on this book".
+  const s = state.progress.activeSession;
+  if (!s || !s.fileId) return;
+  s.updated = Date.now();
+  s.deviceId = getDeviceId();
+  saveLocalMirror();
+}
+
+function clearActiveSession() {
+  if (state.progress.activeSession) {
+    delete state.progress.activeSession;
+    saveLocalMirror();
+  }
 }
 
 function getProgress(fileId) {
@@ -2236,6 +2435,18 @@ function setProgress(fileId, page, meta) {
     next.updated = existing.updated;
   }
   state.progress.files[fileId] = next;
+  // Keep the active-session record in sync with the current page — this
+  // is what another device will pick up on next launch. Only update if
+  // this book is the currently open one (i.e. matches activeSession.fileId),
+  // otherwise we'd overwrite the active book with a background save.
+  const active = state.progress.activeSession;
+  if (active && active.fileId === fileId && (pageChanged || active.page == null)) {
+    active.page = page;
+    active.updated = Date.now();
+    active.deviceId = getDeviceId();
+    if (meta && meta.name) active.fileName = meta.name;
+    if (meta && meta.size != null) active.fileSize = meta.size;
+  }
   saveLocalMirror();
   // Only schedule a cloud write when something actually changed — avoids
   // pointless PATCHes that could also overwrite a newer record on a slow
@@ -2440,6 +2651,13 @@ function syncOnForeground(trigger) {
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
     // Page going to background — save NOW, reliably.
+    // If the reader is still open, refresh the active-session timestamp
+    // FIRST so the keepalive PATCH carries "I'm still on this book right
+    // now". This is exactly the "screen went off with manga open" case
+    // that another device should be able to resume.
+    if (state.reader && !$('reader-screen').classList.contains('hidden')) {
+      touchActiveSession();
+    }
     flushProgressKeepalive();
     return;
   }
@@ -5496,6 +5714,14 @@ function openZip(file, seriesCtx, options = {}) {
   state.reader = new Reader(file, seriesCtx);
   state.reader.start();
 
+  // Mark this book as the "actively being read" session across devices.
+  // Another device opening the app within the TTL will auto-open this book
+  // at the last-known page (see maybeResumeActiveSession on startup).
+  // Cleared when the user explicitly closes the reader (back button etc).
+  const initialPage = getProgress(file.id) || 0;
+  setActiveSession(file, initialPage);
+  scheduleProgressSave();
+
   // Enter fullscreen automatically when opening a NEW manga (i.e. from the
   // file browser or history). Callers that continue a reading session (like
   // advanceToNext/advanceToPrev in the Reader) don't set this flag, so the
@@ -5552,6 +5778,12 @@ function closeReader() {
     state.reader.destroy();
     state.reader = null;
   }
+  // User closed the reader (back/close button) — this is the "I'm done
+  // with this book for now" signal. Clearing the active session prevents
+  // other devices from auto-opening it on their next launch. Note that
+  // advanceToNext/Prev do NOT go through here; they replace the Reader
+  // in-place via openZip, which sets a fresh activeSession for the new book.
+  clearActiveSession();
   if (isFullscreen()) {
     const exitFn = document.exitFullscreen || document.webkitExitFullscreen;
     if (exitFn) exitFn.call(document);
@@ -6295,6 +6527,12 @@ window.addEventListener('DOMContentLoaded', () => {
   window.addEventListener('unhandledrejection', recover('unhandledrejection'));
 
   try {
+    // Populate state.progress from the localStorage mirror BEFORE anything
+    // else touches auth / Drive. This is what makes history render
+    // instantly on app open — the cloud fetch that follows via
+    // initProgressSync just merges in any newer records from other devices.
+    preloadLocalMirror();
+
     initNav();
     wireSignIn();
     wireBrowser();
