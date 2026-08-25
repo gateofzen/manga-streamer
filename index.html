@@ -661,6 +661,13 @@
       </svg>
     </button>
     <button class="icon-btn" id="fullscreen-btn" title="Fullscreen"></button>
+    <button class="icon-btn" id="reader-debug-btn" title="診断情報">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="10"/>
+        <line x1="12" y1="16" x2="12" y2="12"/>
+        <line x1="12" y1="8" x2="12.01" y2="8"/>
+      </svg>
+    </button>
     <div class="page-counter" id="page-counter">0 / 0</div>
   </div>
   <div id="reader-pages"></div>
@@ -1684,6 +1691,30 @@ window.mangaStreamerDebug = async function() {
     }
   }
 
+  // Fetch the CURRENT cloud state of activeSession directly. Bypasses the
+  // in-memory merged state so we can see what's actually stored on the
+  // Drive AppData side. Critical for diagnosing "did A's write reach cloud"
+  // vs "did B's merge preserve it".
+  if (state.progressFileId && state.accessToken) {
+    try {
+      const cloudData = await readProgressFile(state.progressFileId);
+      const cActive = cloudData && cloudData.activeSession;
+      if (cActive) {
+        info.cloudActiveSession = {
+          fileName: cActive.fileName,
+          page: cActive.page,
+          deviceId: cActive.deviceId,
+          isOwnDevice: cActive.deviceId === getDeviceId(),
+          ageMinutes: Math.round((Date.now() - (cActive.updated || 0)) / 60000),
+        };
+      } else {
+        info.cloudActiveSession = '(none in cloud)';
+      }
+    } catch (e) {
+      info.cloudActiveSessionError = e.message;
+    }
+  }
+
   console.log('%c=== Manga Streamer Diagnostic ===', 'color:#ff4d4d;font-weight:bold');
   console.log(info);
   console.log('%c=================================', 'color:#ff4d4d;font-weight:bold');
@@ -2578,7 +2609,31 @@ async function refreshProgress() {
       console.log('[sync] Merged:', Object.keys(mergedFiles).length,
         'books total; cloud contributed newer:', cloudNewerCount,
         '; local had newer:', localHadNewer);
-      state.progress = { version: data.version || 1, files: mergedFiles };
+
+      // CRITICAL: also merge activeSession — this is the cross-device
+      // "currently reading" record. Previously refreshProgress rebuilt
+      // state.progress WITHOUT this field, silently dropping any
+      // activeSession that had just arrived from the cloud. That made
+      // auto-resume unusable: initProgressSync would fetch it correctly,
+      // then the very next foreground refresh would wipe it out before
+      // maybeResumeActiveSession (or a subsequent app open) could act.
+      let mergedActive = state.progress.activeSession;
+      if (data.activeSession) {
+        const localAt = mergedActive ? (mergedActive.updated || 0) : 0;
+        const cloudAt = data.activeSession.updated || 0;
+        if (cloudAt > localAt) {
+          mergedActive = data.activeSession;
+          console.log('[sync] activeSession updated from cloud:',
+            data.activeSession.fileName, 'page', data.activeSession.page,
+            '(deviceId:', data.activeSession.deviceId, ')');
+        }
+      }
+
+      state.progress = {
+        version: data.version || 1,
+        files: mergedFiles,
+        ...(mergedActive ? { activeSession: mergedActive } : {}),
+      };
       saveLocalMirror();
       if (localHadNewer) scheduleProgressSave();
     } else {
@@ -6273,6 +6328,10 @@ function setOverlayState(s) {
 
 function wireReader() {
   $('reader-close').addEventListener('click', navBack);
+  // Reader-side debug button (mirrors the one in the browser topbar) —
+  // needed so we can inspect activeSession WHILE a book is open, which
+  // is exactly when the diagnostic is most useful.
+  $('reader-debug-btn').addEventListener('click', openDebugModal);
   $('view-mode-btn').addEventListener('click', () => {
     if (state.reader) state.reader.toggleViewMode();
   });
