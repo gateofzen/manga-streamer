@@ -3831,26 +3831,37 @@ function _matchVolumeCandidates(candidates, parsedCurrent, direction) {
     parsedCands.push({ file: f, parsed: p });
   }
 
-  // Pass 1: strict normalized-string match. Fastest and least ambiguous.
-  const strict = parsedCands.filter(c => _normSeries(c.parsed.series) === target);
-  if (strict.length) {
-    console.log('[volume-search] strict match found', strict.length, 'candidates for', direction);
-    return strict;
+  // Always run BOTH strict and fuzzy matching, and merge. Previously we
+  // early-returned as soon as strict found anything — but that breaks
+  // libraries where the same series exists under two spellings (typo
+  // variants, kanji variations like 撮 vs 取). If the current file is a
+  // typo variant, strict would only find OTHER typo variants and miss
+  // the vast majority of the series that uses the correct spelling.
+  // Merging catches both: strict for exact-name volumes, fuzzy for
+  // one-character-different volumes.
+  const merged = new Map();  // file.id → {file, parsed}
+  let strictCount = 0, fuzzyCount = 0;
+  for (const c of parsedCands) {
+    if (_normSeries(c.parsed.series) === target) {
+      merged.set(c.file.id, c);
+      strictCount++;
+    }
   }
-
-  // Pass 2: fuzzy token match. Only consider candidates whose longest
-  // significant token matches ours. Guards against wildly different
-  // series with the same tokens by requiring the token to be at least
-  // 2 CJK chars or 3 Latin chars (see _seriesTokens).
-  const fuzzy = parsedCands.filter(c => {
+  for (const c of parsedCands) {
+    if (merged.has(c.file.id)) continue;  // already added via strict
     const cTokens = _seriesTokens(c.parsed.series);
-    return _seriesTokensMatch(targetTokens, cTokens);
-  });
-  if (fuzzy.length) {
-    console.log('[volume-search] FUZZY match found', fuzzy.length, 'candidates for', direction,
-      '(target longest token:', targetTokens[0] || '(none)', ')');
+    if (_seriesTokensMatch(targetTokens, cTokens)) {
+      merged.set(c.file.id, c);
+      fuzzyCount++;
+    }
   }
-  return fuzzy;
+  const result = [...merged.values()];
+  if (result.length) {
+    console.log('[volume-search]', direction + ':', result.length, 'candidates',
+      '(strict:', strictCount, ', fuzzy:', fuzzyCount + ')',
+      '- target token:', targetTokens[0] || '(none)');
+  }
+  return result;
 }
 
 // Pick the best "next volume" from a list of candidate files (already
@@ -6150,6 +6161,22 @@ class Reader {
 }
 
 function openZip(file, seriesCtx, options = {}) {
+  // If we have a local file index, cross-check the file name. The `file`
+  // object passed in may come from stale activeSession data (if the file
+  // was renamed in Drive after being read on another device) or from a
+  // history entry. Using the current index name ensures volume search
+  // and displayed title match reality — otherwise a renamed file's
+  // parseSeriesAndVolume returns a series name no longer in the index,
+  // and next/prev search misses the actual siblings.
+  if (state.allFilesIndex && file && file.id) {
+    const indexEntry = state.allFilesIndex.find(f => f.id === file.id);
+    if (indexEntry && indexEntry.name !== file.name) {
+      console.log('[openZip] Correcting stale file name:', JSON.stringify(file.name),
+        '→', JSON.stringify(indexEntry.name));
+      file = { ...file, name: indexEntry.name };
+    }
+  }
+
   pushNav();
   if (state.reader) state.reader.destroy();
   state.reader = new Reader(file, seriesCtx);
