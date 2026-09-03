@@ -2125,17 +2125,16 @@ async function buildAllFilesIndex() {
   const files = [];
   let pageToken = null;
   let pageCount = 0;
-  const MAX_PAGES = 20;  // safety cap: 20,000 items max
+  const MAX_PAGES = 40;  // safety cap: 40,000 items max
   try {
     do {
       const params = new URLSearchParams({
-        // Use fileExtension for reliable ZIP detection — Drive assigns
-        // multiple mimeTypes to zip files (application/zip,
-        // application/x-zip-compressed, application/octet-stream, etc.)
-        // depending on how the file was uploaded, so filtering by
-        // mimeType alone misses files. fileExtension is set from the
-        // filename extension and is more consistent.
-        q: "(fileExtension = 'zip' or mimeType = 'application/vnd.google-apps.folder') and trashed = false",
+        // ZIP detection: combine multiple criteria so no matter how the
+        // file was uploaded, we catch it. Some ZIPs have fileExtension='zip'
+        // but not mimeType='application/zip' (uploaded from certain OSes),
+        // and vice versa. Drive is inconsistent here — the safest thing is
+        // to OR every reasonable variant together.
+        q: "((fileExtension = 'zip' or mimeType = 'application/zip' or mimeType = 'application/x-zip-compressed' or mimeType = 'application/x-zip') or mimeType = 'application/vnd.google-apps.folder') and trashed = false",
         // Minimum fields for search + volume matching. Skipping
         // size/modifiedTime keeps the response small and the request fast
         // (a big win for the "one big list" query).
@@ -3915,31 +3914,82 @@ async function _gatherVolumeCandidates(currentFile, parsed) {
   const target = _normSeries(parsed.series);
   const targetTokens = _seriesTokens(parsed.series);
 
-  // FASTEST PATH: full local file index is built. Filter it for same-series
-  // ZIPs — instant, no network. Since the index covers the entire Drive
-  // library, this finds volumes anywhere the user has them (not just the
-  // current parent folder).
+  // Predicate: is this file plausibly a same-series volume?
+  const isSameSeries = (f) => {
+    if (!isZip(f) || f.id === currentFile.id) return false;
+    const p = parseSeriesAndVolume(f.name);
+    if (!p) return false;
+    if (_normSeries(p.series) === target) return true;
+    return _seriesTokensMatch(targetTokens, _seriesTokens(p.series));
+  };
+
+  // Merge candidates from THREE sources, in order of reliability + speed:
+  //   1) Local file index (fast, may be incomplete)
+  //   2) Parent folder listing (cached, always includes actual siblings
+  //      even if the index missed them because of Drive metadata quirks)
+  //   3) Drive-wide text search (slowest, use as last resort)
+  //
+  // Previously we short-circuited on the first source that returned
+  // anything — but that meant an incomplete index (which happens when
+  // Drive's fileExtension field is inconsistent) hid the parent folder's
+  // full contents. Now we always merge 1+2, and only fire 3 if we still
+  // don't have enough.
+  const byId = new Map();
+
+  // Source 1: local index
   if (state.allFilesIndex && state.allFilesIndex.length) {
-    const indexMatches = state.allFilesIndex.filter(f => {
-      if (!isZip(f) || f.id === currentFile.id) return false;
-      const p = parseSeriesAndVolume(f.name);
-      if (!p) return false;
-      if (_normSeries(p.series) === target) return true;
-      // Fuzzy fallback: longest significant token matches
-      return _seriesTokensMatch(targetTokens, _seriesTokens(p.series));
-    });
+    const indexMatches = state.allFilesIndex.filter(isSameSeries);
+    for (const f of indexMatches) byId.set(f.id, f);
     if (indexMatches.length) {
-      console.log('[volume-search] LOCAL INDEX:', indexMatches.length,
+      console.log('[volume-search] index contributed', indexMatches.length,
         'candidates in', Date.now() - t0, 'ms');
-      _volumeCandidateCache.set(cacheKey, { at: Date.now(), candidates: indexMatches });
-      return indexMatches;
     }
   }
 
-  // Try two Drive search keywords. The first (cleaned full series name) is
-  // more specific but Drive's `name contains` is token-based and may fail
-  // on exact-string matches with mixed scripts; the second (longest token)
-  // is a looser fallback. We merge results and dedupe.
+  // Source 2: parent folder listing. This is the RELIABLE source — Drive's
+  // list-children query returns actual siblings regardless of mimeType or
+  // fileExtension quirks that trip up the global index.
+  try {
+    let parentIds = currentFile.parents;
+    if (!parentIds || !parentIds.length) {
+      const resp = await driveFetch(
+        `https://www.googleapis.com/drive/v3/files/${currentFile.id}?fields=parents&supportsAllDrives=true`,
+        { priority: 1 }
+      );
+      if (resp.ok) {
+        const data = await readBodyJson(resp);
+        parentIds = data.parents || [];
+      }
+    }
+    if (parentIds && parentIds.length) {
+      const lists = await Promise.all(parentIds.map(pid =>
+        listFolder(pid).catch(() => [])
+      ));
+      const parentSiblings = lists.flat();
+      const parentMatches = parentSiblings.filter(isSameSeries);
+      let addedFromParent = 0;
+      for (const f of parentMatches) {
+        if (!byId.has(f.id)) { byId.set(f.id, f); addedFromParent++; }
+      }
+      console.log('[volume-search] parent folder contributed', addedFromParent,
+        'new candidates (', parentMatches.length, 'total in parent)');
+    }
+  } catch (e) {
+    console.warn('[volume-search] parent listing failed:', e);
+  }
+
+  // Fast path: if merged results already have enough candidates, we're done.
+  const MERGE_THRESHOLD = 3;
+  if (byId.size >= MERGE_THRESHOLD) {
+    const merged = [...byId.values()];
+    console.log('[volume-search] MERGED index+parent:', merged.length,
+      'candidates in', Date.now() - t0, 'ms — skipping Drive search');
+    _volumeCandidateCache.set(cacheKey, { at: Date.now(), candidates: merged });
+    return merged;
+  }
+
+  // Source 3: Drive-wide text search (slowest). Fires only if we still
+  // don't have enough. Runs in parallel with what we already have.
   const cleanedSeries = _stripBrackets(parsed.series).trim();
   const tokenKeyword = searchKeywordForSeries(parsed.series);
   const queries = [];
@@ -3947,58 +3997,6 @@ async function _gatherVolumeCandidates(currentFile, parsed) {
   if (tokenKeyword && tokenKeyword.length >= 2 && tokenKeyword !== cleanedSeries) {
     queries.push(tokenKeyword);
   }
-
-  // Also list the file's PARENT folder. Drive's `name contains` text search
-  // is unreliable for short CJK names (tokenization splits them in ways
-  // that miss substring matches), but listing the parent folder always
-  // returns the exact set of siblings. This is the most reliable source
-  // of sibling-volume candidates — even when the user opened the file
-  // from history (no seriesCtx) or from a different folder than its
-  // actual home.
-  const parentListPromise = (async () => {
-    try {
-      let parentIds = currentFile.parents;
-      if (!parentIds || !parentIds.length) {
-        const resp = await driveFetch(
-          `https://www.googleapis.com/drive/v3/files/${currentFile.id}?fields=parents&supportsAllDrives=true`,
-          { priority: 1 }  // Bumped: prev/next-vol search is user-visible
-        );
-        if (resp.ok) {
-          const data = await readBodyJson(resp);
-          parentIds = data.parents || [];
-        }
-      }
-      if (!parentIds || !parentIds.length) return [];
-      const lists = await Promise.all(parentIds.map(pid =>
-        listFolder(pid).catch(() => [])
-      ));
-      return lists.flat();
-    } catch (e) {
-      console.warn('[volume-search] parent folder list failed:', e);
-      return [];
-    }
-  })();
-
-  // FAST PATH: wait for parent listing first. If it returned enough
-  // candidates in the same series, skip the (expensive) Drive-wide text
-  // search entirely. Well-organized libraries where each series lives in
-  // its own folder get answered from a SINGLE Drive request this way.
-  const parentSiblings = await parentListPromise;
-  const parentMatches = parentSiblings.filter(f => {
-    if (!isZip(f) || f.id === currentFile.id) return false;
-    const p = parseSeriesAndVolume(f.name);
-    return p && _normSeries(p.series) === target;
-  });
-
-  const FAST_PATH_THRESHOLD = 3;  // If parent has ≥ this many series matches, don't search Drive
-  if (parentMatches.length >= FAST_PATH_THRESHOLD) {
-    console.log('[volume-search] FAST PATH: parent folder has', parentMatches.length,
-      'siblings, skipping Drive text search (', Date.now() - t0, 'ms )');
-    _volumeCandidateCache.set(cacheKey, { at: Date.now(), candidates: parentMatches });
-    return parentMatches;
-  }
-
-  // SLOW PATH: also do Drive-wide text searches. These run in parallel.
   const searchPromises = queries.map(async q => {
     try { return await searchDrive(q); }
     catch (e) {
@@ -4007,24 +4005,16 @@ async function _gatherVolumeCandidates(currentFile, parsed) {
     }
   });
   const searchResults = await Promise.all(searchPromises);
-
-  // Merge + dedupe by file id, keep ZIPs only, exclude current file.
-  // Parent-folder siblings are added first because they're the most
-  // reliable indicator of "same series" (Drive text search can spuriously
-  // pull in unrelated files with substring matches).
-  const byId = new Map();
-  const addAll = (list) => {
+  let addedFromDrive = 0;
+  for (const list of searchResults) {
     for (const f of list) {
-      if (!isZip(f)) continue;
-      if (f.id === currentFile.id) continue;
-      if (!byId.has(f.id)) byId.set(f.id, f);
+      if (!isZip(f) || f.id === currentFile.id) continue;
+      if (!byId.has(f.id)) { byId.set(f.id, f); addedFromDrive++; }
     }
-  };
-  addAll(parentSiblings);
-  for (const list of searchResults) addAll(list);
+  }
   const merged = [...byId.values()];
-  console.log('[volume-search] full search:', merged.length, 'candidates in',
-    Date.now() - t0, 'ms (queries:', queries.join(' / '), ')');
+  console.log('[volume-search] full search complete:', merged.length,
+    'candidates in', Date.now() - t0, 'ms (Drive added', addedFromDrive, 'new)');
   _volumeCandidateCache.set(cacheKey, { at: Date.now(), candidates: merged });
   return merged;
 }
