@@ -2527,8 +2527,10 @@ function getDeviceId() {
 //   - visibilitychange→hidden while reader is open (screen off / tab swap)
 // Cleared by:
 //   - Reader closed by user action (back/close button, sign out)
-//   - Automatic expiry (checked on resume): older than 4h = ignore
-const ACTIVE_SESSION_MAX_AGE_MS = 4 * 60 * 60 * 1000;
+//   - Automatic expiry (checked on resume): older than 24 h = ignore
+//   - Auto-cleanup in refreshProgress: own record older than 24 h with
+//     no reader open → tombstone published to cloud
+const ACTIVE_SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 function setActiveSession(file, page) {
   if (!file || !file.id) return;
