@@ -688,6 +688,7 @@
     <pre id="debug-output">読み込み中...</pre>
     <div class="debug-modal-actions">
       <button id="debug-copy-btn">クリップボードにコピー</button>
+      <button id="debug-rebuild-index-btn">インデックスを再構築</button>
       <button id="debug-reload-btn">アプリを更新</button>
       <button id="debug-close-btn">閉じる</button>
     </div>
@@ -2129,20 +2130,42 @@ async function buildAllFilesIndex() {
     do {
       const params = new URLSearchParams({
         q: "(mimeType = 'application/zip' or mimeType = 'application/vnd.google-apps.folder') and trashed = false",
-        fields: 'nextPageToken,files(id,name,mimeType,size,modifiedTime,parents)',
+        // Minimum fields for search + volume matching. Skipping
+        // size/modifiedTime keeps the response small and the request fast
+        // (a big win for the "one big list" query).
+        fields: 'nextPageToken,files(id,name,mimeType,parents)',
         pageSize: '1000',
         spaces: 'drive',
         supportsAllDrives: 'true',
         includeItemsFromAllDrives: 'true',
       });
       if (pageToken) params.set('pageToken', pageToken);
-      // Low priority — this is background work; user-facing fetches
-      // (thumbnails, page images, volume searches) should win the gate.
-      const resp = await driveFetch(
-        'https://www.googleapis.com/drive/v3/files?' + params,
-        { priority: 2 }
-      );
-      if (!resp.ok) throw new Error('Index build failed: ' + resp.status);
+      // Priority 1 (medium) — needed for search to work at all. Was
+      // priority 2 (background), but that would get starved indefinitely
+      // when the drive gate was congested with page/thumbnail fetches,
+      // causing the entire index build to time out at 45s and never
+      // complete. Search then falls back to slow Drive-side lookups that
+      // miss files.
+      let resp;
+      let lastErr;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          resp = await driveFetch(
+            'https://www.googleapis.com/drive/v3/files?' + params,
+            { priority: 1 }
+          );
+          if (resp.ok) break;
+          throw new Error('HTTP ' + resp.status);
+        } catch (e) {
+          lastErr = e;
+          console.warn('[index] page', pageCount + 1, 'attempt', attempt + 1, 'failed:', e.message);
+          if (attempt < 2) {
+            // Exponential backoff: 2s, 5s
+            await new Promise(r => setTimeout(r, attempt === 0 ? 2000 : 5000));
+          }
+        }
+      }
+      if (!resp || !resp.ok) throw lastErr || new Error('Index build failed after 3 attempts');
       const data = await readBodyJson(resp);
       files.push(...(data.files || []));
       pageToken = data.nextPageToken;
@@ -2153,6 +2176,8 @@ async function buildAllFilesIndex() {
     console.log('[index] Built:', files.length, 'files in', Date.now() - t0, 'ms (', pageCount, 'pages )');
   } catch (e) {
     console.warn('[index] Build failed:', e);
+    state.allFilesIndex = null;
+    state.allFilesIndexAt = 0;
   }
 }
 
@@ -3727,15 +3752,51 @@ function _seriesTokens(series) {
 }
 
 // True if two token sets look like they came from the same series.
-// The heuristic: their LONGEST token must match (case-insensitive). The
-// longest token is almost always the actual title (authors/scanlator
-// tags are shorter and, in many filename conventions, appear before the
-// title as prefixes).
+// The heuristic: their LONGEST token must match. Uses fuzzy (edit
+// distance) matching so a single-character difference (typo, kanji
+// variant like 撮 vs 取) still counts as the same series.
 function _seriesTokensMatch(tokensA, tokensB) {
   if (!tokensA.length || !tokensB.length) return false;
   const a = tokensA[0].toLowerCase();
   const b = tokensB[0].toLowerCase();
-  return a === b;
+  if (a === b) return true;
+  // Fuzzy tolerance: same-length-ish tokens with tiny edit distance.
+  // Threshold scales with length so short names aren't over-matched.
+  //   len ≤ 3: no fuzzy match (too easy to confuse different series)
+  //   len 4-6: allow 1 edit  (撮るに足らない vs 取るに足らない → 1 edit ✓)
+  //   len 7-14: allow 2 edits
+  //   len ≥ 15: allow 3 edits
+  const minLen = Math.min(a.length, b.length);
+  if (minLen < 4) return false;
+  if (Math.abs(a.length - b.length) > 3) return false;
+  const maxDist = minLen < 7 ? 1 : minLen < 15 ? 2 : 3;
+  return _editDistance(a, b, maxDist + 1) <= maxDist;
+}
+
+// Levenshtein distance with early termination. Returns Infinity if the
+// distance exceeds `cap` — we only care about "close enough", so bail
+// out fast for wildly different strings.
+function _editDistance(a, b, cap) {
+  const m = a.length, n = b.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+  if (Math.abs(m - n) > cap) return Infinity;
+  let prev = new Array(n + 1);
+  for (let j = 0; j <= n; j++) prev[j] = j;
+  for (let i = 1; i <= m; i++) {
+    const curr = new Array(n + 1);
+    curr[0] = i;
+    let rowMin = i;
+    for (let j = 1; j <= n; j++) {
+      curr[j] = a[i-1] === b[j-1]
+        ? prev[j-1]
+        : 1 + Math.min(prev[j-1], prev[j], curr[j-1]);
+      if (curr[j] < rowMin) rowMin = curr[j];
+    }
+    if (rowMin > cap) return Infinity;  // no path can bring us back under
+    prev = curr;
+  }
+  return prev[n];
 }
 
 // Match `candidates` against the current file's parsed series. First tries
@@ -6612,6 +6673,41 @@ async function forceReload() {
   location.replace(url.toString());
 }
 
+// Rebuild the local file index on demand. Used when the initial
+// background build failed (e.g. drive-gate congestion caused timeouts)
+// or when the user has just added new files and wants them searchable.
+async function rebuildFileIndex() {
+  toast('ファイルインデックスを再構築しています...', 2500);
+  state.allFilesIndex = null;
+  state.allFilesIndexAt = 0;
+  await buildAllFilesIndex();
+  if (state.allFilesIndex) {
+    toast(`インデックスを再構築しました (${state.allFilesIndex.length} ファイル)`, 3000);
+  } else {
+    toast('インデックス構築に失敗しました。 Console を確認してください', 4000);
+  }
+}
+
+// Diagnostic helper: list every indexed file whose name matches
+// `pattern`, showing how it parses into series + volume + normalization.
+// Run from Console: debugSeries('るに足らない')
+window.debugSeries = function(pattern) {
+  if (!state.allFilesIndex) return 'Index not built. Try rebuildFileIndex() first.';
+  const re = pattern instanceof RegExp ? pattern : new RegExp(pattern);
+  const matches = state.allFilesIndex.filter(f => isZip(f) && re.test(f.name));
+  return matches.map(f => {
+    const p = parseSeriesAndVolume(f.name);
+    return {
+      name: f.name,
+      series: p?.series || '(no series)',
+      norm: p ? _normSeries(p.series) : null,
+      longestToken: p ? _seriesTokens(p.series)[0] || '(no tokens)' : null,
+      volume: p?.volume ?? null,
+    };
+  });
+};
+window.rebuildFileIndex = rebuildFileIndex;
+
 function wireBrowser() {
   $('back-btn').addEventListener('click', navBack);
   $('signout-btn').addEventListener('click', signOut);
@@ -6619,6 +6715,7 @@ function wireBrowser() {
   $('debug-close-btn').addEventListener('click', closeDebugModal);
   $('debug-copy-btn').addEventListener('click', copyDebugInfo);
   $('debug-reload-btn').addEventListener('click', forceReload);
+  $('debug-rebuild-index-btn').addEventListener('click', rebuildFileIndex);
   // Also close the modal when tapping the dark overlay outside the content box.
   $('debug-modal').addEventListener('click', (e) => {
     if (e.target.id === 'debug-modal') closeDebugModal();
