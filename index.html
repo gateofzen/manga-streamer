@@ -2129,7 +2129,13 @@ async function buildAllFilesIndex() {
   try {
     do {
       const params = new URLSearchParams({
-        q: "(mimeType = 'application/zip' or mimeType = 'application/vnd.google-apps.folder') and trashed = false",
+        // Use fileExtension for reliable ZIP detection — Drive assigns
+        // multiple mimeTypes to zip files (application/zip,
+        // application/x-zip-compressed, application/octet-stream, etc.)
+        // depending on how the file was uploaded, so filtering by
+        // mimeType alone misses files. fileExtension is set from the
+        // filename extension and is more consistent.
+        q: "(fileExtension = 'zip' or mimeType = 'application/vnd.google-apps.folder') and trashed = false",
         // Minimum fields for search + volume matching. Skipping
         // size/modifiedTime keeps the response small and the request fast
         // (a big win for the "one big list" query).
