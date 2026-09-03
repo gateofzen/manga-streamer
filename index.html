@@ -1824,8 +1824,8 @@ async function maybeResumeActiveSession() {
   if (ageMs > ACTIVE_SESSION_MAX_AGE_MS) {
     console.log('[resume] active session too old (' + Math.round(ageMs / 60000) + ' min), ignoring');
     // Clear the stale record to prevent revisiting this check every launch.
+    // clearActiveSession now scheduleProgressSave()'s internally.
     clearActiveSession();
-    scheduleProgressSave();
     return;
   }
   if (s.deviceId === getDeviceId()) {
@@ -2556,12 +2556,30 @@ function touchActiveSession() {
 }
 
 function clearActiveSession() {
-  if (state.progress.activeSession) {
-    const s = state.progress.activeSession;
-    delete state.progress.activeSession;
-    saveLocalMirror();
+  const s = state.progress.activeSession;
+  if (s && s.fileId) {
     console.log('[active-session] CLEAR (was:', s.fileName, 'page', s.page, ')');
   }
+  // Write a TOMBSTONE (activeSession with fileId=null and a fresh
+  // timestamp) instead of just deleting the field. Two reasons:
+  //   1) The merge in refreshProgress picks the entry with the newest
+  //      `updated` timestamp — if we simply delete locally, the next
+  //      cloud merge sees "local has nothing, cloud has entry" and
+  //      restores the old activeSession. A tombstone with a fresh
+  //      timestamp beats the stale cloud entry.
+  //   2) It propagates the "cleared" state to other devices via the
+  //      normal cloud sync, so they don't try to auto-resume a book
+  //      the user just closed.
+  // Consumers of activeSession always check `s.fileId` before acting on
+  // it, so a tombstone is treated as "no active session".
+  state.progress.activeSession = {
+    fileId: null,
+    updated: Date.now(),
+    deviceId: getDeviceId(),
+  };
+  saveLocalMirror();
+  // Push to cloud NOW so other devices see the clear right away.
+  scheduleProgressSave();
 }
 
 function getProgress(fileId) {
@@ -2700,6 +2718,24 @@ async function refreshProgress() {
     console.warn('[sync] refreshProgress: no progress file ID');
     return;
   }
+
+  // Auto-cleanup: if OUR OWN activeSession is stale (older than the
+  // resume TTL and no reader is open), clear it. This prevents the
+  // cloud from carrying an ancient "currently reading" record for a
+  // book the user actually finished with hours ago. Only touches
+  // records we ourselves wrote — never overrides another device's
+  // recent session.
+  const own = state.progress.activeSession;
+  if (own && own.fileId && own.deviceId === getDeviceId()) {
+    const age = Date.now() - (own.updated || 0);
+    const readerOpen = state.reader && !$('reader-screen').classList.contains('hidden');
+    if (age > ACTIVE_SESSION_MAX_AGE_MS && !readerOpen) {
+      console.log('[active-session] auto-cleanup: stale own record (' +
+        Math.round(age / 60000) + ' min old, no reader open)');
+      clearActiveSession();
+    }
+  }
+
   console.log('[sync] Refreshing progress from cloud');
   showSync(true);
   try {
@@ -6548,7 +6584,9 @@ async function openDebugModal() {
     progressFileId: state.progressFileId || '(not initialized)',
     bookCountLocal: Object.keys(state.progress.files || {}).length,
     deviceId: getDeviceId(),
-    activeSession: active ? {
+    // A tombstone (fileId == null) counts as "no active session" — an
+    // explicit-clear marker used to propagate the deletion across devices.
+    activeSession: (active && active.fileId) ? {
       fileName: active.fileName,
       page: active.page,
       deviceId: active.deviceId,
@@ -6611,7 +6649,7 @@ async function openDebugModal() {
         5000
       );
       const cActive = cloudData && cloudData.activeSession;
-      if (cActive) {
+      if (cActive && cActive.fileId) {
         partial.cloudActiveSession = {
           fileName: cActive.fileName,
           page: cActive.page,
