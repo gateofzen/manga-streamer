@@ -788,6 +788,7 @@ const state = {
   // index isn't ready yet.
   allFilesIndex: null,        // Array of {id, name, mimeType, size, modifiedTime, parents}
   allFilesIndexAt: 0,          // Last-built timestamp
+  filesByParent: null,         // Map<parentId, files[]> — for O(1) sibling lookup
   folderStack: [{ id: 'root', name: 'My Drive' }],
   currentFiles: [],
   reader: null,
@@ -2178,11 +2179,30 @@ async function buildAllFilesIndex() {
     } while (pageToken && pageCount < MAX_PAGES);
     state.allFilesIndex = files;
     state.allFilesIndexAt = Date.now();
-    console.log('[index] Built:', files.length, 'files in', Date.now() - t0, 'ms (', pageCount, 'pages )');
+
+    // Pre-group files by parent folder ID. This lets volume search look
+    // up siblings via `state.filesByParent.get(parentId)` instead of
+    // calling listFolder() (a Drive API round-trip) — a huge win because
+    // it makes the parent-folder branch of _gatherVolumeCandidates
+    // essentially free once the index is built.
+    const byParent = new Map();
+    for (const f of files) {
+      if (f.parents) {
+        for (const pid of f.parents) {
+          if (!byParent.has(pid)) byParent.set(pid, []);
+          byParent.get(pid).push(f);
+        }
+      }
+    }
+    state.filesByParent = byParent;
+
+    console.log('[index] Built:', files.length, 'files in', Date.now() - t0, 'ms (', pageCount, 'pages )',
+      '— indexed', byParent.size, 'parent folders');
   } catch (e) {
     console.warn('[index] Build failed:', e);
     state.allFilesIndex = null;
     state.allFilesIndexAt = 0;
+    state.filesByParent = null;
   }
 }
 
@@ -3939,8 +3959,18 @@ function _pickPrevVolume(candidates, parsedCurrent) {
 const _volumeCandidateCache = new Map();  // seriesKey → { at, candidates }
 const VOLUME_CANDIDATE_TTL_MS = 3 * 60 * 1000;
 
+// In-flight search map: when searchNextVolume and searchPrevVolume are
+// called at the same time (which happens on every Reader.start), we don't
+// want BOTH to run the full gather — they'd duplicate every network
+// request and both wait on Drive twice. The second call to arrive
+// piggybacks on the first's promise, gets the same result, and everyone
+// wins.
+const _inFlightVolumeSearches = new Map();  // seriesKey → Promise<candidates>
+
 async function _gatherVolumeCandidates(currentFile, parsed) {
   const cacheKey = _normSeries(parsed.series);
+
+  // Completed cache
   const cached = _volumeCandidateCache.get(cacheKey);
   if (cached && Date.now() - cached.at < VOLUME_CANDIDATE_TTL_MS) {
     console.log('[volume-search] cache HIT for series:', cacheKey,
@@ -3948,6 +3978,23 @@ async function _gatherVolumeCandidates(currentFile, parsed) {
     return cached.candidates.filter(f => f.id !== currentFile.id);
   }
 
+  // In-flight coalescing
+  if (_inFlightVolumeSearches.has(cacheKey)) {
+    console.log('[volume-search] joining in-flight search for series:', cacheKey);
+    const candidates = await _inFlightVolumeSearches.get(cacheKey);
+    return candidates.filter(f => f.id !== currentFile.id);
+  }
+
+  const promise = _doGatherVolumeCandidates(currentFile, parsed, cacheKey);
+  _inFlightVolumeSearches.set(cacheKey, promise);
+  try {
+    return await promise;
+  } finally {
+    _inFlightVolumeSearches.delete(cacheKey);
+  }
+}
+
+async function _doGatherVolumeCandidates(currentFile, parsed, cacheKey) {
   const t0 = Date.now();
   const target = _normSeries(parsed.series);
   const targetTokens = _seriesTokens(parsed.series);
@@ -3984,12 +4031,20 @@ async function _gatherVolumeCandidates(currentFile, parsed) {
     }
   }
 
-  // Source 2: parent folder listing. This is the RELIABLE source — Drive's
-  // list-children query returns actual siblings regardless of mimeType or
-  // fileExtension quirks that trip up the global index.
+  // Source 2: parent folder listing. Try the local index for parents first
+  // before hitting Drive — the index has this info for most files, saving
+  // a full Drive round-trip.
   try {
     let parentIds = currentFile.parents;
     if (!parentIds || !parentIds.length) {
+      // Look up in the local index (free) before falling back to Drive.
+      if (state.allFilesIndex) {
+        const entry = state.allFilesIndex.find(f => f.id === currentFile.id);
+        if (entry && entry.parents) parentIds = entry.parents;
+      }
+    }
+    if (!parentIds || !parentIds.length) {
+      // Last resort: fetch parents from Drive.
       const resp = await driveFetch(
         `https://www.googleapis.com/drive/v3/files/${currentFile.id}?fields=parents&supportsAllDrives=true`,
         { priority: 1 }
@@ -4000,10 +4055,30 @@ async function _gatherVolumeCandidates(currentFile, parsed) {
       }
     }
     if (parentIds && parentIds.length) {
-      const lists = await Promise.all(parentIds.map(pid =>
-        listFolder(pid).catch(() => [])
-      ));
-      const parentSiblings = lists.flat();
+      // Try the index-based grouping first — a plain Map lookup instead of
+      // a Drive round-trip. Only fall back to listFolder if the index has
+      // no entries for this parent (unusual — either the folder is new
+      // since index build, or all its ZIPs were somehow missed).
+      let parentSiblings = null;
+      if (state.filesByParent) {
+        const indexSiblings = [];
+        for (const pid of parentIds) {
+          const s = state.filesByParent.get(pid);
+          if (s) indexSiblings.push(...s);
+        }
+        if (indexSiblings.length) {
+          parentSiblings = indexSiblings;
+          console.log('[volume-search] parent siblings from INDEX:', indexSiblings.length);
+        }
+      }
+      if (!parentSiblings) {
+        // Fallback: Drive listing (network round-trip, ~300-500ms)
+        const lists = await Promise.all(parentIds.map(pid =>
+          listFolder(pid).catch(() => [])
+        ));
+        parentSiblings = lists.flat();
+        console.log('[volume-search] parent siblings from Drive listing:', parentSiblings.length);
+      }
       const parentMatches = parentSiblings.filter(isSameSeries);
       let addedFromParent = 0;
       for (const f of parentMatches) {
@@ -6189,19 +6264,28 @@ class Reader {
 }
 
 function openZip(file, seriesCtx, options = {}) {
-  // If we have a local file index, cross-check the file name. The `file`
-  // object passed in may come from stale activeSession data (if the file
-  // was renamed in Drive after being read on another device) or from a
-  // history entry. Using the current index name ensures volume search
-  // and displayed title match reality — otherwise a renamed file's
-  // parseSeriesAndVolume returns a series name no longer in the index,
-  // and next/prev search misses the actual siblings.
+  // If we have a local file index, cross-check the file name and enrich
+  // with `parents`. Two problems this solves:
+  //   (a) `file` may come from stale activeSession or history data — its
+  //       `name` might not match the current Drive filename, which breaks
+  //       volume search (parseSeriesAndVolume returns the wrong series).
+  //   (b) File objects from history/activeSession usually don't include
+  //       `parents`. Volume search needs parents to list siblings, and
+  //       without them it makes an extra Drive round-trip per open.
+  //       Filling parents from the index eliminates that call.
   if (state.allFilesIndex && file && file.id) {
     const indexEntry = state.allFilesIndex.find(f => f.id === file.id);
-    if (indexEntry && indexEntry.name !== file.name) {
-      console.log('[openZip] Correcting stale file name:', JSON.stringify(file.name),
-        '→', JSON.stringify(indexEntry.name));
-      file = { ...file, name: indexEntry.name };
+    if (indexEntry) {
+      const patch = {};
+      if (indexEntry.name !== file.name) {
+        console.log('[openZip] Correcting stale file name:', JSON.stringify(file.name),
+          '→', JSON.stringify(indexEntry.name));
+        patch.name = indexEntry.name;
+      }
+      if ((!file.parents || !file.parents.length) && indexEntry.parents) {
+        patch.parents = indexEntry.parents;
+      }
+      if (Object.keys(patch).length) file = { ...file, ...patch };
     }
   }
 
@@ -6209,6 +6293,17 @@ function openZip(file, seriesCtx, options = {}) {
   if (state.reader) state.reader.destroy();
   state.reader = new Reader(file, seriesCtx);
   state.reader.start();
+
+  // Prefetch volume candidates in the background — kicks off IMMEDIATELY
+  // instead of waiting for Reader.start to finish loading the ZIP and
+  // rendering the first page. By the time the reader wants to show the
+  // next/prev cards, the search is already done (or nearly so) and comes
+  // out of the in-flight cache. Fire-and-forget; errors are handled inside.
+  const parsed = parseSeriesAndVolume(file.name);
+  if (parsed) {
+    _gatherVolumeCandidates(file, parsed).catch(err =>
+      console.warn('[openZip] prefetch failed:', err));
+  }
 
   // Mark this book as the "actively being read" session across devices.
   // Another device opening the app within the TTL will auto-open this book
