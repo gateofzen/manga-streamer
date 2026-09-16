@@ -3233,10 +3233,16 @@ class ZipReader {
   }
 
   async open(signal = null) {
+    // Priority 0 (highest) for ZIP structure fetches — these MUST complete
+    // before any page can be shown. Making them beat every other queued
+    // request avoids the "reader stuck on loading spinner" problem when
+    // the drive gate is congested with thumbnails, volume-search fetches,
+    // or preloaded neighbor pages.
+    const OPEN_PRIORITY = 0;
     const tailMax = 65557;
     const tailSize = Math.min(this.fileSize, tailMax);
     const tailStart = this.fileSize - tailSize;
-    const tail = await fetchRange(this.fileId, tailStart, this.fileSize - 1, signal);
+    const tail = await fetchRange(this.fileId, tailStart, this.fileSize - 1, signal, OPEN_PRIORITY);
     const tv = new DataView(tail.buffer, tail.byteOffset, tail.byteLength);
 
     let eocdLocal = -1;
@@ -3253,7 +3259,7 @@ class ZipReader {
       const locLocal = eocdLocal - 20;
       if (locLocal >= 0 && tv.getUint32(locLocal, true) === 0x07064b50) {
         const z64Off = Number(tv.getBigUint64(locLocal + 8, true));
-        const z64Buf = await fetchRange(this.fileId, z64Off, z64Off + 55, signal);
+        const z64Buf = await fetchRange(this.fileId, z64Off, z64Off + 55, signal, OPEN_PRIORITY);
         const z64v = new DataView(z64Buf.buffer, z64Buf.byteOffset, z64Buf.byteLength);
         if (z64v.getUint32(0, true) !== 0x06064b50) throw new Error('ZIP64 EOCD signature mismatch');
         totalEntries = Number(z64v.getBigUint64(32, true));
@@ -3266,7 +3272,7 @@ class ZipReader {
     if (cdOffset >= tailStart) {
       cd = tail.subarray(cdOffset - tailStart, cdOffset - tailStart + cdSize);
     } else {
-      cd = await fetchRange(this.fileId, cdOffset, cdOffset + cdSize - 1, signal);
+      cd = await fetchRange(this.fileId, cdOffset, cdOffset + cdSize - 1, signal, OPEN_PRIORITY);
     }
     const cv = new DataView(cd.buffer, cd.byteOffset, cd.byteLength);
 
@@ -6294,15 +6300,23 @@ function openZip(file, seriesCtx, options = {}) {
   state.reader = new Reader(file, seriesCtx);
   state.reader.start();
 
-  // Prefetch volume candidates in the background — kicks off IMMEDIATELY
-  // instead of waiting for Reader.start to finish loading the ZIP and
-  // rendering the first page. By the time the reader wants to show the
-  // next/prev cards, the search is already done (or nearly so) and comes
-  // out of the in-flight cache. Fire-and-forget; errors are handled inside.
+  // Prefetch volume candidates in the background — but with a small
+  // delay so the reader's initial fetches (ZIP tail, central directory,
+  // first page image) don't have to compete with volume search on the
+  // Drive gate. The first ~1 second after openZip is critical for
+  // showing the first page; volume search results only matter when the
+  // user reaches the last (or first) page, which takes seconds at
+  // minimum. Delay by 1500ms so reader startup gets a clear runway.
   const parsed = parseSeriesAndVolume(file.name);
   if (parsed) {
-    _gatherVolumeCandidates(file, parsed).catch(err =>
-      console.warn('[openZip] prefetch failed:', err));
+    setTimeout(() => {
+      // Only fire if this reader is still active — if the user opened
+      // another file, don't waste bandwidth on the abandoned one.
+      if (state.reader && state.reader.file && state.reader.file.id === file.id) {
+        _gatherVolumeCandidates(file, parsed).catch(err =>
+          console.warn('[openZip] deferred prefetch failed:', err));
+      }
+    }, 1500);
   }
 
   // Mark this book as the "actively being read" session across devices.
