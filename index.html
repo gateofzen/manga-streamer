@@ -6404,6 +6404,17 @@ function closeReader() {
   else renderFileList(state.currentFiles);
   showScreen('browser-screen');
   flushProgressSave().catch(() => {});  // fire-and-forget
+
+  // If we came back to an empty folder view (currentFiles never loaded —
+  // typical when the user was auto-resumed into a book before the initial
+  // loadCurrentFolder finished, or when a prior fetch failed), kick off a
+  // fresh folder load so the user isn't staring at a blank screen.
+  const onFolder = !state.history && !state.searching;
+  const currentIsEmpty = !state.currentFiles || state.currentFiles.length === 0;
+  if (onFolder && currentIsEmpty) {
+    console.log('[closeReader] currentFiles empty — reloading folder');
+    loadCurrentFolder();
+  }
 }
 
 //===========================================================================
