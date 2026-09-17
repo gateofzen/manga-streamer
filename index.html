@@ -688,6 +688,7 @@
     <pre id="debug-output">読み込み中...</pre>
     <div class="debug-modal-actions">
       <button id="debug-copy-btn">クリップボードにコピー</button>
+      <button id="debug-reload-folder-btn">フォルダを再読込</button>
       <button id="debug-rebuild-index-btn">インデックスを再構築</button>
       <button id="debug-reload-btn">アプリを更新</button>
       <button id="debug-close-btn">閉じる</button>
@@ -4184,6 +4185,29 @@ async function loadCurrentFolder() {
   $('breadcrumb').innerHTML = breadcrumbHtml + '<span class="sync-dot" id="sync-dot"></span>';
 
   $('file-list').innerHTML = '<div class="spinner"></div>';
+  // Escape hatch: if the spinner is still up after 12 seconds, the drive
+  // gate or a listFolder call is probably hung. Show a tappable "reload"
+  // option so the user can recover without needing to open the debug
+  // modal or restart the app.
+  const staleWatchdog = setTimeout(() => {
+    const cur = $('file-list');
+    if (!cur || !cur.querySelector('.spinner')) return;  // already loaded
+    if (token !== state._folderLoadToken) return;  // already superseded
+    cur.innerHTML = `
+      <div style="padding:24px;text-align:center;color:var(--text-dim);font-size:14px">
+        <div style="margin-bottom:16px">読み込みに時間がかかっています</div>
+        <button id="folder-retry-btn" style="padding:10px 20px;background:var(--accent);color:white;border:none;border-radius:8px;font-size:14px;cursor:pointer">再試行</button>
+      </div>
+    `;
+    const btn = document.getElementById('folder-retry-btn');
+    if (btn) {
+      btn.addEventListener('click', () => {
+        _folderContentsCache.clear();
+        _inFlightVolumeSearches.clear();
+        loadCurrentFolder();
+      });
+    }
+  }, 12000);
   // Token to ignore background updates from a previous folder if the user
   // navigates away before they finish.
   const token = ++state._folderLoadToken;
@@ -4253,7 +4277,14 @@ async function loadCurrentFolder() {
     }
   } catch (e) {
     if (token !== state._folderLoadToken) return;
-    $('file-list').innerHTML = `<div class="empty-state">Error: ${escapeHtml(e.message)}</div>`;
+    $('file-list').innerHTML = `<div class="empty-state">Error: ${escapeHtml(e.message)}<br><br><button id="folder-retry-err-btn" style="padding:10px 20px;background:var(--accent);color:white;border:none;border-radius:8px;font-size:14px;margin-top:12px">再試行</button></div>`;
+    const btn = document.getElementById('folder-retry-err-btn');
+    if (btn) btn.addEventListener('click', () => {
+      _folderContentsCache.clear();
+      loadCurrentFolder();
+    });
+  } finally {
+    clearTimeout(staleWatchdog);
   }
 }
 
@@ -6725,6 +6756,18 @@ async function openDebugModal() {
           builtMinutesAgo: Math.round((Date.now() - state.allFilesIndexAt) / 60000),
         }
       : '(not built yet)',
+    // Drive gate: how many concurrent Drive requests are running and
+    // how many are queued waiting for a slot. If active is at cap
+    // (usually 4) and waiters keep growing, the gate is congested —
+    // a stuck request is holding slots and blocking everything else.
+    driveGate: {
+      active: _driveActive,
+      activeByPriority: [..._driveActiveByPriority],
+      waiting: _driveWaitQueues.map(q => q.length),
+    },
+    // Folder view state (helps diagnose "stuck on spinner" issues)
+    currentFolderName: state.folderStack?.[state.folderStack.length - 1]?.name || '(none)',
+    currentFilesCount: state.currentFiles?.length ?? '(unset)',
     _environment: {
       userAgent: navigator.userAgent,
       url: location.origin + location.pathname,
@@ -6871,6 +6914,30 @@ async function rebuildFileIndex() {
   }
 }
 
+// Force-reload the current folder view. Also unclogs a stuck drive gate:
+// if requests are hung on slots, we can't recover without dropping them
+// (JavaScript can't abort a Promise mid-await), but we CAN clear caches
+// and re-issue a fresh load. Since the stuck old requests will eventually
+// hit their timeout and release slots, the new load will get through.
+async function reloadFolderFromDebug() {
+  toast('フォルダを再読込しています...', 2000);
+  closeDebugModal();
+  // Clear folder cache so we get fresh data
+  _folderContentsCache.clear();
+  // Clear in-flight volume searches (they may be holding drive slots)
+  _inFlightVolumeSearches.clear();
+  // If we're not already on the browser screen, switch to it
+  if ($('browser-screen').classList.contains('hidden')) {
+    showScreen('browser-screen');
+  }
+  try {
+    await loadCurrentFolder();
+  } catch (e) {
+    console.warn('[reload-folder] failed:', e);
+    toast('再読込に失敗しました: ' + e.message, 4000);
+  }
+}
+
 // Diagnostic helper: list every indexed file whose name matches
 // `pattern`, showing how it parses into series + volume + normalization.
 // Run from Console: debugSeries('るに足らない')
@@ -6899,6 +6966,7 @@ function wireBrowser() {
   $('debug-copy-btn').addEventListener('click', copyDebugInfo);
   $('debug-reload-btn').addEventListener('click', forceReload);
   $('debug-rebuild-index-btn').addEventListener('click', rebuildFileIndex);
+  $('debug-reload-folder-btn').addEventListener('click', reloadFolderFromDebug);
   // Also close the modal when tapping the dark overlay outside the content box.
   $('debug-modal').addEventListener('click', (e) => {
     if (e.target.id === 'debug-modal') closeDebugModal();
