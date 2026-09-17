@@ -1579,8 +1579,15 @@ let _tokenRefreshPromise = null;
 // seen in the logs. With the reservation, foreground page reads can always
 // claim 2 slots immediately even while dozens of thumbnails are queued.
 const DRIVE_PRIORITY_LEVELS = 4;
-const DRIVE_TOTAL_CAP = 4;
-const DRIVE_PRIORITY_CAPS = [4, 2, 1, 1];
+// Increased caps: HTTP/2 handles many concurrent Drive requests well, and
+// Google's rate limits (20,000 req/100s per user) are far above what any
+// realistic browsing session generates. The old caps (total=4, P1=2) were
+// causing hundreds of thumbnail + prefetch requests to queue behind two
+// slow ones — a single 45s-hung request could stall the whole UI. With
+// higher caps, transient hangs affect a proportionally smaller share of
+// slots and the queue drains fast enough for the UI to feel responsive.
+const DRIVE_TOTAL_CAP = 10;
+const DRIVE_PRIORITY_CAPS = [10, 8, 4, 2];
 // How many gate slots to keep available for foreground (P0) when deciding
 // whether to admit a lower-priority (P1+) request.
 const FOREGROUND_RESERVE = 2;
@@ -4185,6 +4192,12 @@ async function loadCurrentFolder() {
   $('breadcrumb').innerHTML = breadcrumbHtml + '<span class="sync-dot" id="sync-dot"></span>';
 
   $('file-list').innerHTML = '<div class="spinner"></div>';
+  // Cancel any pending thumbnail loads from the previous folder view.
+  // Otherwise 94+ queued thumb fetches from a previous folder keep
+  // occupying gate slots and slow down the new folder's own loads.
+  if (typeof cancelAllThumbnailLoads === 'function') {
+    cancelAllThumbnailLoads();
+  }
   // Escape hatch: if the spinner is still up after 12 seconds, the drive
   // gate or a listFolder call is probably hung. Show a tappable "reload"
   // option so the user can recover without needing to open the debug
@@ -6922,10 +6935,35 @@ async function rebuildFileIndex() {
 async function reloadFolderFromDebug() {
   toast('フォルダを再読込しています...', 2000);
   closeDebugModal();
+  // Flush queued drive gate waiters — they may be background thumb/prefetch
+  // requests that piled up while the gate was congested. Reject them so
+  // they don't compete with our new folder load.
+  let flushedCount = 0;
+  for (let p = 1; p < DRIVE_PRIORITY_LEVELS; p++) {
+    const q = _driveWaitQueues[p];
+    while (q.length > 0) {
+      const resolver = q.shift();
+      // Resolve so the caller can proceed to its finally block; then in
+      // driveFetch, the fetch will still get made or aborted per the
+      // caller's own signal. If we reject, some callers may explode.
+      try { resolver(p); flushedCount++; } catch {}
+    }
+  }
+  // Reset gate counters — they'll be off by however many resolvers we
+  // released. This is intentional: those tasks are effectively "leaked"
+  // but they'll error out or complete on their own timelines.
+  if (flushedCount > 0) {
+    console.warn('[gate-flush] released', flushedCount, 'waiters');
+    _driveActive = _driveActiveByPriority[0];
+    for (let p = 1; p < DRIVE_PRIORITY_LEVELS; p++) _driveActiveByPriority[p] = 0;
+    toast(`Drive gate から ${flushedCount} 件を解放しました`, 2500);
+  }
   // Clear folder cache so we get fresh data
   _folderContentsCache.clear();
   // Clear in-flight volume searches (they may be holding drive slots)
   _inFlightVolumeSearches.clear();
+  // Cancel pending thumbnails
+  if (typeof cancelAllThumbnailLoads === 'function') cancelAllThumbnailLoads();
   // If we're not already on the browser screen, switch to it
   if ($('browser-screen').classList.contains('hidden')) {
     showScreen('browser-screen');
