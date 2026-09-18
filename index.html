@@ -1101,14 +1101,25 @@ async function peekFolderModified(folderId, opts = {}) {
 }
 
 async function enrichFolderModifiedTimes(files) {
-  // Run peeks in parallel; the global Drive concurrency gate keeps the
-  // total in-flight count safe. Folders without inner content keep their
-  // raw modifiedTime via effectiveModifiedTime's fallback.
+  // Limit parallelism explicitly. Folder peeks are P2 (background) — but
+  // firing 200+ Drive queries in parallel via Promise.all packs the drive
+  // gate's wait queue with hundreds of items, and any slow request stalls
+  // the whole app because P0/P1 waiters can't get slots. A small
+  // concurrency limit ties up at most this many gate waiters at a time.
   const folders = files.filter(isFolder);
-  await Promise.all(folders.map(async f => {
-    const ts = await peekFolderModified(f.id);
-    if (ts) f._effectiveModifiedTime = ts;
-  }));
+  const CONCURRENCY = 6;
+  let idx = 0;
+  const workers = Array.from({ length: Math.min(CONCURRENCY, folders.length) }, async () => {
+    while (idx < folders.length) {
+      const my = idx++;
+      const f = folders[my];
+      try {
+        const ts = await peekFolderModified(f.id);
+        if (ts) f._effectiveModifiedTime = ts;
+      } catch {}
+    }
+  });
+  await Promise.all(workers);
 }
 
 function relTime(ts) {
@@ -1920,19 +1931,35 @@ function _driveRecordFailure(tag) {
 
 async function driveFetch(url, init = {}) {
   const tag = '[driveFetch ' + Math.random().toString(36).substring(2, 7) + ']';
-  // If circuit breaker is open, fail fast — no point queueing more
-  // requests that will just time out and add to the pileup.
-  if (Date.now() < _driveCircuitOpenUntil) {
+  const priority = init.priority ?? 1;
+  // Circuit breaker: reject non-foreground requests when open. FOREGROUND
+  // requests (P0 — reader page fetches, ZIP structure) always go through:
+  // when the user is actively reading a page, we MUST attempt the fetch
+  // even if the network is bad. Background enrichment (thumbnails, folder
+  // peeks, index build) is what should stand down.
+  if (priority > 0 && Date.now() < _driveCircuitOpenUntil) {
     throw new Error('Drive circuit breaker open');
   }
-  const p = await _driveAcquire(init.priority);
+  const p = await _driveAcquire(priority);
   try {
     const resp = await _driveFetchInner(url, init, tag);
-    if (resp && resp.ok) _driveRecordSuccess();
+    if (resp && resp.ok) {
+      _driveRecordSuccess();
+      // Any success closes the circuit early — if Drive is answering us
+      // again, no need to keep rejecting other work.
+      if (_driveCircuitOpenUntil > Date.now()) {
+        console.log('[drive-circuit] closing early after success');
+        _driveCircuitOpenUntil = 0;
+      }
+    }
     return resp;
   } catch (e) {
-    // Timeout or network error — record for circuit breaker
-    if (e && (e.message === 'Network timeout' || e.message === 'Drive circuit breaker open' || e.name === 'AbortError')) {
+    // Timeout or network error — record for circuit breaker. Don't count
+    // AbortError from the caller's own signal (e.g. reader destroyed) —
+    // that's not a Drive failure. Also don't count the circuit-breaker's
+    // own rejection.
+    const msg = e && e.message;
+    if (msg === 'Network timeout') {
       _driveRecordFailure(tag);
     }
     throw e;
@@ -2164,7 +2191,24 @@ async function searchDrive(query) {
 // token-based and unreliable for CJK. Users see "file X exists but
 // search doesn't find it" all the time. Client-side substring match
 // after Unicode normalization is far more forgiving and instant.
+let _indexBuildInFlight = null;
+
 async function buildAllFilesIndex() {
+  // Coalesce concurrent calls — if one build is already running, just
+  // await it. Otherwise we duplicate the 20+ page requests and pile up
+  // the drive gate for no benefit.
+  if (_indexBuildInFlight) {
+    console.log('[index] Build already in progress — joining');
+    return _indexBuildInFlight;
+  }
+  _indexBuildInFlight = (async () => {
+    try { await _doBuildAllFilesIndex(); }
+    finally { _indexBuildInFlight = null; }
+  })();
+  return _indexBuildInFlight;
+}
+
+async function _doBuildAllFilesIndex() {
   console.log('[index] Building local file index...');
   const t0 = Date.now();
   const files = [];
